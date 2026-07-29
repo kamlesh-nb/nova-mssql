@@ -17,7 +17,7 @@
 // The wire CODEC (frame build + token decode) is pure over byte buffers, gated
 // offline (100_mssql_codec); connect/query wire it to a TcpStream, live-verified.
 import net.asyncio;
-import net.asynctls;
+import net.wolftls;
 import bytes;
 import string;
 import list;
@@ -604,7 +604,7 @@ pub fn decodeTokens(stream: string): MsResult {
 
 // --- buffered TDS packet reader over a live TCP stream (raw or TLS-tunneled) ---
 // A1 async-first seam: the reader's transport is an `asyncio.AsyncIO` — AsyncStream (cleartext)
-// or asynctls.TlsStream (once the TDS-tunneled TLS handshake completes; every packet from LOGIN7
+// or wolftls.WolfTlsStream (once the TDS-tunneled TLS handshake completes; every packet from LOGIN7
 // on is then TLS-protected, and TlsStream's recvInto/sendStr do the raw post-handshake TLS).
 struct TdsReader {
     pub io: asyncio.AsyncIO,
@@ -819,9 +819,9 @@ async fn msReadN(base: asyncio.AsyncStream, buf: ptr, n: int): bool {
 // the crypto; this pump wraps each outbound TLS FLIGHT in ONE PRELOGIN (0x12) packet (SQL Server
 // rejects a flight split across packets) and unwraps inbound PRELOGIN payloads back into wolfSSL —
 // awaiting the socket throughout. After the handshake, TLS runs RAW over the socket (the plaintext
-// is the TDS packets), so a plain asynctls.TlsStream carries the encrypted session. SQL Server ships
+// is the TDS packets), so a plain wolftls.WolfTlsStream carries the encrypted session. SQL Server ships
 // a self-signed cert (drivers use TrustServerCertificate), so verification is off (a follow-on).
-async fn tdsTlsHandshake(base: asyncio.AsyncStream): asynctls.TlsStream {
+async fn tdsTlsHandshake(base: asyncio.AsyncStream): wolftls.WolfTlsStream {
     let ctx = nova_mtls_new("" as ptr, 0);
     let cbuf = bytes.alloc(16384);
     let hbuf = bytes.alloc(8);
@@ -848,7 +848,7 @@ async fn tdsTlsHandshake(base: asyncio.AsyncStream): asynctls.TlsStream {
             nova_mtls_feed(ctx, pbuf as ptr, plen);
         }
     }
-    let ts = asynctls.TlsStream(base, ctx);
+    let ts = wolftls.WolfTlsStream(base, ctx);
     ts.handshakeOk = true;   // handshake was driven above (tunneled), skip TlsStream's own
     return ts;
 }
