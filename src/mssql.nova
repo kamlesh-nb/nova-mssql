@@ -506,7 +506,7 @@ fn readValue(c: Cur, ct: ColType): DbValue {
         let n = cu8(c);
         if (n == 0) { return db.dbNull(); }
         if (n != 16) { cskip(c, n); return db.dbNull(); }
-        return db.dbText(guidToString(cbytes(c, 16)));   // canonical UUID string, not raw bytes
+        return db.dbUuid(guidToString(cbytes(c, 16)));   // canonical UUID string
     }
     // Unknown/unsupported -> best effort: stop the row cleanly by returning null.
     return db.dbNull();
