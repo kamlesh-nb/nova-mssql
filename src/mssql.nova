@@ -16,7 +16,7 @@
 //
 // The wire CODEC (frame build + token decode) is pure over byte buffers, gated
 // offline (100_mssql_codec); connect/query wire it to a TcpStream, live-verified.
-import net.asyncio;
+import net.aio;
 import net.asynctls;
 import net.tls12bio;
 import net.tlsmembio;
@@ -605,16 +605,16 @@ pub fn decodeTokens(stream: string): MsResult {
 }
 
 // --- buffered TDS packet reader over a live TCP stream (raw or TLS-tunneled) ---
-// A1 async-first seam: the reader's transport is an `asyncio.AsyncIO` — AsyncStream (cleartext)
+// A1 async-first seam: the reader's transport is an `aio.AsyncIO` — AsyncStream (cleartext)
 // or asynctls.TlsStream (once the TDS-tunneled TLS handshake completes; every packet from LOGIN7
 // on is then TLS-protected, and TlsStream's recvInto/sendStr do the raw post-handshake TLS).
 struct TdsReader {
-    pub io: asyncio.AsyncIO,
+    pub io: aio.AsyncIO,
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: asyncio.AsyncIO) {
+    init(io: aio.AsyncIO) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -664,7 +664,7 @@ async fn readMessage(r: TdsReader): string {
 }
 
 // Raw send over the base AsyncStream (PRELOGIN is always cleartext) — parks on the write.
-async fn sendRaw(io: asyncio.AsyncStream, frame: string): int {
+async fn sendRaw(io: aio.AsyncStream, frame: string): int {
     return await io.sendStr(frame);
 }
 // Channel send: over the reader's transport (raw socket, or TLS once encryption is on) — parks.
@@ -807,7 +807,7 @@ fn msBufToStr(buf: ptr, n: int): string {
     return out as string;
 }
 // Read EXACTLY `n` bytes from the raw base stream into `buf` (a TDS-handshake helper). Parks.
-async fn msReadN(base: asyncio.AsyncStream, buf: ptr, n: int): bool {
+async fn msReadN(base: aio.AsyncStream, buf: ptr, n: int): bool {
     let got = 0;
     while (got < n) {
         let r = await base.recvInto((buf + got) as int, n - got);
@@ -823,7 +823,7 @@ async fn msReadN(base: asyncio.AsyncStream, buf: ptr, n: int): bool {
 // awaiting the socket throughout. After the handshake, TLS runs RAW over the socket (the plaintext
 // is the TDS packets), so a plain asynctls.TlsStream (pure-Nova TLS 1.2 bio) carries the encrypted session. SQL Server ships
 // a self-signed cert (drivers use TrustServerCertificate), so verification is off (a follow-on).
-async fn tdsTlsHandshake(base: asyncio.AsyncStream, host: string): asynctls.TlsStream {
+async fn tdsTlsHandshake(base: aio.AsyncStream, host: string): asynctls.TlsStream {
     let bio: tlsmembio.TlsBio = tls12bio.newClient12Bio(host);
     let cbuf = bytes.alloc(16384);
     let hbuf = bytes.alloc(8);
@@ -858,7 +858,7 @@ async fn tdsTlsHandshake(base: asyncio.AsyncStream, host: string): asynctls.TlsS
 // Whole connect (PRELOGIN → optional tunneled TLS → LOGIN7) as ONE async fn, driven once.
 async fn msConnectAsync(dsn: string): MssqlConnection {
     let d = parseDsn(dsn);
-    let base = await asyncio.asyncConnect(d.host, d.port);
+    let base = await aio.asyncConnect(d.host, d.port);
     // PRELOGIN (cleartext) — advertise ON when the DSN asks for encryption, else NOT_SUP.
     let sn = await sendRaw(base, tdsPacket(PKT_PRELOGIN, buildPrelogin(d.encrypt)));
     let reader = TdsReader(base);        // reads PRELOGIN over the raw stream
