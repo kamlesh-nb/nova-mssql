@@ -89,3 +89,15 @@ fn test_token_stream_row_decode(): void {
     assert.equalStr(row.getText(1), "hi");
     assert.equalStr(`${row.getDecimal(2)}`, "19.99");   // exact decimal128, not f64
 }
+
+@test
+fn test_error_rides_on_result(): void {
+    // T1: a TDS ERROR token (decodeTokens -> r.ok=false, r.err=message) is now mapped onto the seam
+    // result by query/exec/prepared instead of being buried in the tag or dropped.
+    let e = db.DbError("", "Invalid object name 'nope'.");
+    let rs = db.errorResult(e);
+    assert.isTrue(rs.hasError());
+    assert.equalStr(rs.err.message, "Invalid object name 'nope'.");
+    assert.isTrue(db.errorExec(e).hasError());
+    assert.isTrue(!db.ResultSet().hasError());
+}

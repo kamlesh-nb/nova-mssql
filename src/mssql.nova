@@ -723,13 +723,14 @@ pub struct MssqlConnection impl Connection {
         let sn = await chanSend(self.reader, tdsPacket(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params))));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
+        if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token on the result
         return r.rs;
     }
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         let sn = await chanSend(self.reader, tdsPacket(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params))));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
-        if (!r.ok) { return ExecResult(0, "ERROR: " + r.err); }
+        if (!r.ok) { return errorExec(DbError("", r.err)); }
         return ExecResult(r.affected, "");
     }
     pub fn close(self): void {
@@ -784,6 +785,7 @@ pub struct MssqlConnection impl Connection {
         let _cs = await chanSend(self.reader, self.buildExecuteRpc(s.handle, params));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
+        if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token
         return r.rs;
     }
 
@@ -793,7 +795,7 @@ pub struct MssqlConnection impl Connection {
         let _cs = await chanSend(self.reader, self.buildExecuteRpc(s.handle, params));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
-        if (!r.ok) { return ExecResult(0, "ERROR: " + r.err); }
+        if (!r.ok) { return errorExec(DbError("", r.err)); }
         return ExecResult(r.affected, "");
     }
 }
