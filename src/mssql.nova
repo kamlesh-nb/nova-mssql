@@ -741,22 +741,30 @@ fn rpcParamNVarcharNull(): string {
 pub struct MssqlConnection impl Connection {
     pub reader: TdsReader,
     pub stmts: List<MsStmt>,   // D6: server-side prepared-statement cache (sp_prepare handles)
+    pub busy: bool,            // concurrency guard: one in-flight request per connection
     init(reader: TdsReader) {
         self.reader = reader;
         self.stmts = List<MsStmt>();
+        self.busy = false;
     }
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let sn = await chanSend(self.reader, tdsPacket(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params))));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
         if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token on the result
+        self.busy = false;
         return r.rs;
     }
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let sn = await chanSend(self.reader, tdsPacket(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params))));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
-        if (!r.ok) { return errorExec(DbError("", r.err)); }
+        if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err)); }
+        self.busy = false;
         return ExecResult(r.affected, "");
     }
     pub fn close(self): void {
@@ -817,22 +825,28 @@ pub struct MssqlConnection impl Connection {
     }
 
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
-        if (stmt < 0 || stmt >= self.stmts.size()) { return ResultSet(); }
+        if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        if (stmt < 0 || stmt >= self.stmts.size()) { self.busy = false; return ResultSet(); }
         let s = self.stmts.get(stmt) ?? MsStmt(0, "");
         let _cs = await chanSend(self.reader, self.buildExecuteRpc(s.handle, params));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
         if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token
+        self.busy = false;
         return r.rs;
     }
 
     pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
-        if (stmt < 0 || stmt >= self.stmts.size()) { return ExecResult(0, ""); }
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        if (stmt < 0 || stmt >= self.stmts.size()) { self.busy = false; return ExecResult(0, ""); }
         let s = self.stmts.get(stmt) ?? MsStmt(0, "");
         let _cs = await chanSend(self.reader, self.buildExecuteRpc(s.handle, params));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
-        if (!r.ok) { return errorExec(DbError("", r.err)); }
+        if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err)); }
+        self.busy = false;
         return ExecResult(r.affected, "");
     }
 }
