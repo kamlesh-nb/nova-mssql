@@ -758,6 +758,13 @@ pub struct MssqlConnection impl Connection {
         self.reader.io.close();   // TlsStream.close frees the TLS ctx; AsyncStream.close shuts the socket
     }
 
+    // Transaction control (T-SQL). NOTE: these run as separate SQLBatch messages with the transaction
+    // descriptor hardcoded 0 (see tdsPacket / buildSqlBatch), so a multi-batch transaction is not yet
+    // bound to the server's descriptor -- ENVCHANGE(txn) tracking is a follow-on. Single-batch use is fine.
+    pub async fn begin(self): ExecResult { return await self.exec("BEGIN TRANSACTION", List<DbValue>()); }
+    pub async fn commit(self): ExecResult { return await self.exec("COMMIT TRANSACTION", List<DbValue>()); }
+    pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK TRANSACTION", List<DbValue>()); }
+
     pub fn setTimeout(self, ms: int): int {   // D6 — async per-recv awaited deadline (cleartext or TLS)
         return self.reader.io.setTimeout(ms);
     }
