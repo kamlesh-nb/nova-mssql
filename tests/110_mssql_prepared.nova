@@ -67,6 +67,24 @@ fn test_rpc_frame_procid(): void {
 }
 
 @test
+fn test_sp_unprepare_rpc(): void {
+    // T14: sp_unprepare (ProcID 15) releases a prepared handle. RPC = ALL_HEADERS(22) then
+    // [0xFFFF][procId=15 u16][flags u16][one INTN param carrying the handle].
+    let f = mssql.buildUnprepare(9);
+    assert.equalInt(f[22], 255);          // 0xFFFF (name-by-procid)
+    assert.equalInt(f[23], 255);
+    assert.equalInt(f[24], 15);           // ProcID 15 = sp_unprepare (low byte)
+    assert.equalInt(f[25], 0);            // high byte
+    // param at offset 28: [name len 0][status 0][type 0x26 INTN][maxlen 4][actual 4][value u32]
+    assert.equalInt(f[28], 0);            // name length
+    assert.equalInt(f[29], 0);            // status (not OUTPUT)
+    assert.equalInt(f[30], 38);           // 0x26 INTN
+    assert.equalInt(f[31], 4);            // max len
+    assert.equalInt(f[32], 4);            // actual len
+    assert.equalInt(f[33], 9);            // handle value (low byte)
+}
+
+@test
 fn test_nbcrow_decode_with_null(): void {
     // Craft COLMETADATA(2 nvarchar cols) + NBCROW(col0 NULL, col1 "hi") + DONE, then decode.
     let s = List<int>();

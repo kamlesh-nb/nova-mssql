@@ -131,3 +131,55 @@ fn test_attention_packet(): void {
     assert.equalInt(a[0], 6);          // packet type = ATTENTION
     assert.equalInt(a[1], 1);          // status = EOM
 }
+
+@test
+fn test_chunk_large_message(): void {
+    // T14: a message larger than the packet size splits into multiple TDS packets. payload 5000,
+    // packetSize 512 -> maxData 504 -> ceil(5000/504) = 10 packets (9 x 504 + 1 x 464 remainder).
+    let payload = bytes.alloc(5000);
+    let i = 0;
+    while (i < 5000) { bytes.write_byte(payload, i, i & 255); i = i + 1; }
+    let out = mssql.chunkTdsMessage(1, payload as string, 512);
+
+    let pos = 0;
+    let count = 0;
+    let expectId = 1;
+    let dataTotal = 0;
+    let n = out.length;
+    while (pos < n) {
+        let ptype = out[pos] & 255;
+        let status = out[pos + 1] & 255;
+        let plen = (out[pos + 2] & 255) * 256 + (out[pos + 3] & 255);
+        let pid = out[pos + 6] & 255;
+        assert.equalInt(ptype, 1);            // same type on every packet
+        assert.equalInt(pid, expectId);       // packetId increments 1,2,3,...
+        let isLast = pos + plen >= n;
+        if (isLast) {
+            assert.equalInt(status, 1);       // EOM on the final packet
+            assert.equalInt(plen, 8 + 464);   // remainder length (472)
+        } else {
+            assert.equalInt(status, 0);       // normal (not EOM)
+            assert.equalInt(plen, 512);       // full packetSize
+        }
+        dataTotal = dataTotal + (plen - 8);
+        pos = pos + plen;
+        count = count + 1;
+        expectId = expectId + 1;
+    }
+    assert.equalInt(count, 10);               // ceil(5000/504)
+    assert.equalInt(dataTotal, 5000);         // all payload bytes carried
+}
+
+@test
+fn test_chunk_single_packet(): void {
+    // T14: a payload that fits emits ONE packet with EOM status and packetId 1.
+    let payload = bytes.alloc(100);
+    let i = 0;
+    while (i < 100) { bytes.write_byte(payload, i, 65); i = i + 1; }
+    let out = mssql.chunkTdsMessage(1, payload as string, 4096);
+    assert.equalInt(out.length, 108);          // one 8-byte header + 100 payload
+    assert.equalInt(out[1] & 255, 1);          // EOM status
+    assert.equalInt(out[6] & 255, 1);          // packetId 1
+    let plen = (out[2] & 255) * 256 + (out[3] & 255);
+    assert.equalInt(plen, 108);                // length covers the whole single packet
+}

@@ -88,12 +88,45 @@ const PKT_PRELOGIN: int = 18;  // 0x12
 // request on THIS connection (unlike Postgres, which cancels from a side connection).
 pub fn buildAttention(): string { return tdsPacket(PKT_ATTENTION, ""); }
 
+// The negotiated default TDS packet size (MS-TDS): messages larger than this are split.
+const TDS_DEFAULT_PACKET_SIZE: int = 4096;
+
+// Split a whole TDS MESSAGE into one or more packets of at most `packetSize` bytes each (header
+// included). Pure over byte buffers — emits the full multi-packet stream. Every packet carries the
+// same `msgType`; the STATUS byte is 0x00 ("normal") on all but the LAST packet, which is 0x01
+// ("EOM"). `packetId` increments 1-based (mod 256). A packet holds up to (packetSize - 8) payload
+// bytes. An empty payload still yields exactly one EOM packet (header only) — matching ATTENTION.
+pub fn chunkTdsMessage(msgType: int, payload: string, packetSize: int): string {
+    let maxData = packetSize - 8;
+    if (maxData < 1) { maxData = 1; }
+    let total = payload.length;
+    if (total == 0) {
+        // Header-only EOM packet (e.g. ATTENTION): [type][status=EOM][len=8:be16][spid][pid=1][win]
+        return b1(msgType) + b1(1) + u16beStr(8) + b1(0) + b1(0) + b1(1) + b1(0);
+    }
+    let out = "";
+    let offset = 0;
+    let packetId = 1;
+    while (offset < total) {
+        let remaining = total - offset;
+        let chunk = if (remaining > maxData) maxData else remaining;
+        let last = offset + chunk >= total;
+        let status = if (last) 1 else 0;
+        // Built from b1()/u16beStr() (each returns an owned string that the concat drains) — a raw
+        // `bytes.alloc(8) as string` intermediate is NOT drained and leaks its buffer.
+        // [type][status][len:be16 total incl header][spid:be16][packetid][window]
+        out = out + b1(msgType) + b1(status) + u16beStr(8 + chunk) + b1(0) + b1(0)
+            + b1(packetId & 255) + b1(0) + string.slice(payload, offset, offset + chunk);
+        offset = offset + chunk;
+        packetId = packetId + 1;   // masked to a byte on write; wraps mod 256
+    }
+    return out;
+}
+
+// Frame a whole outgoing TDS message, chunking at the default packet size. A payload that fits in a
+// single packet emits one EOM packet — byte-identical to the pre-chunking single-packet framing.
 fn tdsPacket(ptype: int, payload: string): string {
-    let total = 8 + payload.length;
-    // Built from b1()/u16beStr() (each returns an owned string that the concat drains) — a raw
-    // `bytes.alloc(8) as string` intermediate is NOT drained and leaks its buffer.
-    // [type][status=EOM][len:be16][spid:be16][packetid][window]
-    return b1(ptype) + b1(1) + u16beStr(total) + b1(0) + b1(0) + b1(1) + b1(0) + payload;
+    return chunkTdsMessage(ptype, payload, TDS_DEFAULT_PACKET_SIZE);
 }
 
 // --- PRELOGIN: option table {token, offset:be16, len:be16}... 0xFF, then data ---
@@ -224,6 +257,12 @@ pub fn rpcParamNVarchar(text: string): string {
 // Build an RPC request for a system procedure by its well-known ProcID.
 pub fn buildRpc(procId: int, params: string): string {
     return rpcAllHeaders() + u16le(65535) + u16le(procId) + u16le(0) + params;
+}
+
+// sp_unprepare(@handle): release a server-side prepared-statement handle (ProcID 15). One INTN
+// param carrying the handle returned by sp_prepare. Returns the RPC body (wrap in tdsPacket to send).
+pub fn buildUnprepare(handle: long): string {
+    return buildRpc(SP_UNPREPARE, rpcParamIntN(false, handle));
 }
 
 // Convert the seam's `$1..$N` placeholders to T-SQL `@P1..@PN`, and report the highest N seen.
@@ -848,6 +887,18 @@ pub struct MssqlConnection impl Connection {
         if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err)); }
         self.busy = false;
         return ExecResult(r.affected, "");
+    }
+
+    // Release a server-side prepared handle via sp_unprepare (ProcID 15) and drop it from the cache.
+    // Frees the plan the matching prepare() reserved on the server. No-op for an out-of-range index.
+    pub async fn dropPrepared(self, stmt: int): void {
+        if (self.busy) { return; }
+        if (stmt < 0 || stmt >= self.stmts.size()) { return; }
+        self.busy = true;
+        let s = self.stmts.get(stmt) ?? MsStmt(0, "");
+        let _cs = await chanSend(self.reader, tdsPacket(PKT_RPC, buildUnprepare(s.handle)));
+        let _msg = await readMessage(self.reader);
+        self.busy = false;
     }
 }
 
