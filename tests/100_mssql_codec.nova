@@ -122,3 +122,12 @@ fn mssqlHexNib(c: int): int {
     if (c >= 97 && c <= 102) { return c - 97 + 10; }
     return 0;
 }
+
+@test
+fn test_attention_packet(): void {
+    // T8: ATTENTION is an empty TDS message of type 6, EOM status, 8-byte header.
+    let a = mssql.buildAttention();
+    assert.equalInt(a.length, 8);      // header only, no payload
+    assert.equalInt(a[0], 6);          // packet type = ATTENTION
+    assert.equalInt(a[1], 1);          // status = EOM
+}

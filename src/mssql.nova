@@ -80,8 +80,13 @@ pub fn obfuscatePassword(pw: string): string {
 
 // --- TDS packet framing: [type][status][len:be16][spid:be16][packetid][window] ---
 const PKT_SQLBATCH: int = 1;
+const PKT_ATTENTION: int = 6;  // 0x06 -- cancel the request in progress
 const PKT_LOGIN7: int = 16;    // 0x10
 const PKT_PRELOGIN: int = 18;  // 0x12
+
+// An ATTENTION packet: an empty-payload TDS message of type 6 (EOM). Sent to cancel the in-flight
+// request on THIS connection (unlike Postgres, which cancels from a side connection).
+pub fn buildAttention(): string { return tdsPacket(PKT_ATTENTION, ""); }
 
 fn tdsPacket(ptype: int, payload: string): string {
     let total = 8 + payload.length;
@@ -764,6 +769,10 @@ pub struct MssqlConnection impl Connection {
     pub async fn begin(self): ExecResult { return await self.exec("BEGIN TRANSACTION", List<DbValue>()); }
     pub async fn commit(self): ExecResult { return await self.exec("COMMIT TRANSACTION", List<DbValue>()); }
     pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK TRANSACTION", List<DbValue>()); }
+
+    // Cancel the in-flight request on this connection by sending a TDS ATTENTION packet. The server
+    // acknowledges with an attention token in the response stream; call from another coroutine on a deadline.
+    pub async fn cancel(self): void { let _ = await chanSend(self.reader, buildAttention()); }
 
     pub fn setTimeout(self, ms: int): int {   // D6 — async per-recv awaited deadline (cleartext or TLS)
         return self.reader.io.setTimeout(ms);
