@@ -829,6 +829,7 @@ async fn tdsTlsHandshake(base: aio.AsyncStream, host: string): asynctls.TlsStrea
     let bio: tlsmembio.TlsBio = tls12bio.newClient12Bio(host);
     let cbuf = bytes.alloc(16384);
     let hbuf = bytes.alloc(8);
+    let ok = false;
     while (true) {
         let st = bio.step();
         // Coalesce the whole outbound flight, then send it as ONE PRELOGIN packet.
@@ -839,8 +840,8 @@ async fn tdsTlsHandshake(base: aio.AsyncStream, host: string): asynctls.TlsStrea
             flight = flight + msBufToStr(cbuf, pn);
         }
         if (flight.length > 0) { let sn = await base.sendStr(tdsPacket(PKT_PRELOGIN, flight)); }
-        if (st == 0) { break; }        // handshake complete
-        if (st < 0) { break; }         // handshake error
+        if (st == 0) { ok = true; break; }   // handshake complete
+        if (st < 0) { break; }               // handshake error
         // Read one inbound TDS packet (8-byte header + payload) and feed its payload to the bio.
         if (!(await msReadN(base, hbuf, 8))) { break; }
         let hi = bytes.read_byte(hbuf, 2) & 255;
@@ -852,8 +853,14 @@ async fn tdsTlsHandshake(base: aio.AsyncStream, host: string): asynctls.TlsStrea
             bio.feed(pbuf as ptr, plen);
         }
     }
+    bytes.free(cbuf);
+    bytes.free(hbuf);
     let ts = asynctls.TlsStream(base, bio);
-    ts.handshakeOk = true;   // handshake was driven above (tunneled), skip TlsStream's own
+    // Report the REAL handshake outcome (was hardcoded true, so a failed tunneled handshake looked
+    // successful). The TLS 1.2 memory-BIO authenticates the peer key exchange but does NOT yet validate
+    // the server certificate against a CA (tls12bio has no verify path); chain verification is a
+    // TLS-1.2-chain-verify follow-on before mssql can be MITM-safe. Callers check ts.ok().
+    ts.handshakeOk = ok;
     return ts;
 }
 
@@ -870,6 +877,7 @@ async fn msConnectAsync(dsn: string): MssqlConnection {
     // packet from LOGIN7 on is then TLS-protected, and the reader's transport becomes the TlsStream.
     if (d.encrypt && serverEnc != 2) {   // 2 = ENCRYPT_NOT_SUP
         let ts = await tdsTlsHandshake(base, d.host);
+        if (!ts.ok()) { console.err("mssql: TLS handshake failed"); }
         reader.io = ts;
     }
     // LOGIN7 (obfuscated password; encrypted iff TLS is on)
