@@ -183,3 +183,54 @@ fn test_chunk_single_packet(): void {
     let plen = (out[2] & 255) * 256 + (out[3] & 255);
     assert.equalInt(plen, 108);                // length covers the whole single packet
 }
+
+@test
+fn test_status_byte_reset(): void {
+    // T14: statusByte seam — EOM 0x01, RESETCONNECTION 0x08, combined 0x09.
+    assert.equalInt(mssql.statusByte(true, false), 0x01);   // EOM only
+    assert.equalInt(mssql.statusByte(true, true), 0x09);    // EOM + RESETCONNECTION
+    assert.equalInt(mssql.statusByte(false, true), 0x08);   // RESETCONNECTION only (not EOM)
+    assert.equalInt(mssql.statusByte(false, false), 0x00);  // normal
+}
+
+@test
+fn test_reset_single_packet(): void {
+    // T14: a reset-pending single-packet message carries EOM+RESETCONNECTION (0x09) on the one packet.
+    let payload = bytes.alloc(100);
+    let i = 0;
+    while (i < 100) { bytes.write_byte(payload, i, 65); i = i + 1; }
+    let out = mssql.chunkTdsMessageReset(1, payload as string, 4096, true);
+    assert.equalInt(out[1] & 255, 0x09);       // first (=last) packet: EOM | RESETCONNECTION
+    assert.equalInt(out[6] & 255, 1);          // packetId 1
+    // Without reset, the same payload is plain EOM (0x01) — no reset bit leaks in.
+    let plain = mssql.chunkTdsMessageReset(1, payload as string, 4096, false);
+    assert.equalInt(plain[1] & 255, 0x01);
+}
+
+@test
+fn test_reset_first_packet_only(): void {
+    // T14: reset applies to the WHOLE message but is stamped on the FIRST packet only; the final
+    // packet must still carry EOM (0x01) without the reset bit.
+    let payload = bytes.alloc(5000);
+    let i = 0;
+    while (i < 5000) { bytes.write_byte(payload, i, 66); i = i + 1; }
+    let out = mssql.chunkTdsMessageReset(1, payload as string, 512, true);
+    // First packet: RESETCONNECTION set, not EOM (more packets follow) -> 0x08.
+    assert.equalInt(out[1] & 255, 0x08);
+    assert.equalInt(out[6] & 255, 1);          // packetId 1
+    // Walk to the final packet and confirm EOM without the reset bit.
+    let pos = 0;
+    let n = out.length;
+    let lastStatus = 0;
+    let secondStatus = -1;
+    let seen = 0;
+    while (pos < n) {
+        let plen = (out[pos + 2] & 255) * 256 + (out[pos + 3] & 255);
+        lastStatus = out[pos + 1] & 255;
+        if (seen == 1) { secondStatus = out[pos + 1] & 255; }
+        pos = pos + plen;
+        seen = seen + 1;
+    }
+    assert.equalInt(secondStatus, 0x00);       // second (middle) packet: no reset, no EOM
+    assert.equalInt(lastStatus, 0x01);         // final packet: EOM only, reset bit not repeated
+}

@@ -91,18 +91,31 @@ pub fn buildAttention(): string { return tdsPacket(PKT_ATTENTION, ""); }
 // The negotiated default TDS packet size (MS-TDS): messages larger than this are split.
 const TDS_DEFAULT_PACKET_SIZE: int = 4096;
 
+// T14: compute a TDS packet-header STATUS byte. EOM (0x01) marks the last packet of a message;
+// RESETCONNECTION (0x08, fResetConnection) tells the server to reset session state (SET options,
+// temp tables, open transaction) before running the batch — set by the pool on a reused connection.
+// (RFC status flags: EOM 0x01, IGNORE 0x02, RESETCONNECTION 0x08, RESETCONNECTIONSKIPTRAN 0x10.)
+// Pure/testable seam.
+pub fn statusByte(isEom: bool, reset: bool): int {
+    let s = if (isEom) 0x01 else 0x00;
+    if (reset) { s = s | 0x08; }
+    return s;
+}
+
 // Split a whole TDS MESSAGE into one or more packets of at most `packetSize` bytes each (header
 // included). Pure over byte buffers — emits the full multi-packet stream. Every packet carries the
 // same `msgType`; the STATUS byte is 0x00 ("normal") on all but the LAST packet, which is 0x01
 // ("EOM"). `packetId` increments 1-based (mod 256). A packet holds up to (packetSize - 8) payload
 // bytes. An empty payload still yields exactly one EOM packet (header only) — matching ATTENTION.
-pub fn chunkTdsMessage(msgType: int, payload: string, packetSize: int): string {
+// When `reset` is true the RESETCONNECTION bit (0x08) is OR'd into the FIRST packet's status only —
+// the reset applies to the whole message, and the server keys off the first packet.
+pub fn chunkTdsMessageReset(msgType: int, payload: string, packetSize: int, reset: bool): string {
     let maxData = packetSize - 8;
     if (maxData < 1) { maxData = 1; }
     let total = payload.length;
     if (total == 0) {
-        // Header-only EOM packet (e.g. ATTENTION): [type][status=EOM][len=8:be16][spid][pid=1][win]
-        return b1(msgType) + b1(1) + u16beStr(8) + b1(0) + b1(0) + b1(1) + b1(0);
+        // Header-only EOM packet (e.g. ATTENTION): first packet is also last, so reset lands here too.
+        return b1(msgType) + b1(statusByte(true, reset)) + u16beStr(8) + b1(0) + b1(0) + b1(1) + b1(0);
     }
     let out = "";
     let offset = 0;
@@ -111,7 +124,8 @@ pub fn chunkTdsMessage(msgType: int, payload: string, packetSize: int): string {
         let remaining = total - offset;
         let chunk = if (remaining > maxData) maxData else remaining;
         let last = offset + chunk >= total;
-        let status = if (last) 1 else 0;
+        let first = offset == 0;
+        let status = statusByte(last, reset && first);
         // Built from b1()/u16beStr() (each returns an owned string that the concat drains) — a raw
         // `bytes.alloc(8) as string` intermediate is NOT drained and leaks its buffer.
         // [type][status][len:be16 total incl header][spid:be16][packetid][window]
@@ -123,10 +137,20 @@ pub fn chunkTdsMessage(msgType: int, payload: string, packetSize: int): string {
     return out;
 }
 
+// Back-compat wrapper: chunk with no connection-reset pending.
+pub fn chunkTdsMessage(msgType: int, payload: string, packetSize: int): string {
+    return chunkTdsMessageReset(msgType, payload, packetSize, false);
+}
+
+// Frame a whole outgoing TDS message with an explicit reset flag, chunking at the default packet size.
+fn tdsPacketReset(ptype: int, payload: string, reset: bool): string {
+    return chunkTdsMessageReset(ptype, payload, TDS_DEFAULT_PACKET_SIZE, reset);
+}
+
 // Frame a whole outgoing TDS message, chunking at the default packet size. A payload that fits in a
 // single packet emits one EOM packet — byte-identical to the pre-chunking single-packet framing.
 fn tdsPacket(ptype: int, payload: string): string {
-    return chunkTdsMessage(ptype, payload, TDS_DEFAULT_PACKET_SIZE);
+    return tdsPacketReset(ptype, payload, false);
 }
 
 // --- PRELOGIN: option table {token, offset:be16, len:be16}... 0xFF, then data ---
@@ -781,15 +805,30 @@ pub struct MssqlConnection impl Connection {
     pub reader: TdsReader,
     pub stmts: List<MsStmt>,   // D6: server-side prepared-statement cache (sp_prepare handles)
     pub busy: bool,            // concurrency guard: one in-flight request per connection
+    pub resetPending: bool,    // T14: a pool set this on reuse; next batch/RPC carries RESETCONNECTION
     init(reader: TdsReader) {
         self.reader = reader;
         self.stmts = List<MsStmt>();
         self.busy = false;
+        self.resetPending = false;
+    }
+
+    // T14: a connection pool calls this when handing a reused connection back out. The next SQLBatch/RPC
+    // this connection sends will carry the RESETCONNECTION (0x08) status bit, telling the server to reset
+    // session state (SET options, temp tables, open transaction) before running it. Cleared on use.
+    pub fn markForReset(self): void { self.resetPending = true; }
+
+    // Consume the pending-reset flag: returns whether the next packet should carry RESETCONNECTION and
+    // clears it so the reset applies to exactly one message.
+    fn takeReset(self): bool {
+        let r = self.resetPending;
+        self.resetPending = false;
+        return r;
     }
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
         if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let sn = await chanSend(self.reader, tdsPacket(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params))));
+        let sn = await chanSend(self.reader, tdsPacketReset(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params)), self.takeReset()));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
         if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token on the result
@@ -799,7 +838,7 @@ pub struct MssqlConnection impl Connection {
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let sn = await chanSend(self.reader, tdsPacket(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params))));
+        let sn = await chanSend(self.reader, tdsPacketReset(PKT_SQLBATCH, buildSqlBatch(substituteParams(sql, params)), self.takeReset()));
         let msg = await readMessage(self.reader);
         let r = decodeTokens(msg);
         if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err)); }
@@ -860,7 +899,7 @@ pub struct MssqlConnection impl Connection {
             else { ps = ps + rpcParamNVarchar(msValueText(p)); }
             i = i + 1;
         }
-        return tdsPacket(PKT_RPC, buildRpc(SP_EXECUTE, ps));
+        return tdsPacketReset(PKT_RPC, buildRpc(SP_EXECUTE, ps), self.takeReset());
     }
 
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
