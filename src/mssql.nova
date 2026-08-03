@@ -419,6 +419,24 @@ fn decodeDecimal(mag: string, negative: bool, scale: int): decimal {
 }
 
 // Read one ROW value for a column type. Returns dbNull() for NULLs.
+fn hexch(v: int): int { if (v < 10) { return 48 + v; } return 97 + (v - 10); }
+fn hex2(b: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, hexch((b / 16) & 15));
+    bytes.write_byte(p, 1, hexch(b & 15));
+    return p as string;
+}
+// SQL Server UNIQUEIDENTIFIER stores {Data1(4 LE), Data2(2 LE), Data3(2 LE), Data4(8)}. Render the
+// canonical 8-4-4-4-12 UUID string (the first three groups are byte-reversed from storage).
+pub fn guidToString(raw: string): string {
+    let g1 = hex2(raw[3]) + hex2(raw[2]) + hex2(raw[1]) + hex2(raw[0]);
+    let g2 = hex2(raw[5]) + hex2(raw[4]);
+    let g3 = hex2(raw[7]) + hex2(raw[6]);
+    let g4 = hex2(raw[8]) + hex2(raw[9]);
+    let g5 = hex2(raw[10]) + hex2(raw[11]) + hex2(raw[12]) + hex2(raw[13]) + hex2(raw[14]) + hex2(raw[15]);
+    return `${g1}-${g2}-${g3}-${g4}-${g5}`;
+}
+
 fn readValue(c: Cur, ct: ColType): DbValue {
     let t = ct.t;
     if (t == T_INT1) { return db.dbInt(cu8(c)); }
@@ -469,20 +487,21 @@ fn readValue(c: Cur, ct: ColType): DbValue {
     }
     if (t == T_MONEY) { return db.dbDecimal(decodeMoney8(c)); }
     if (t == T_MONEY4) { return db.dbDecimal(decodeMoney4(c)); }
-    // FLOAT decode is DEFERRED (no bytes.read_f64 reinterpret builtin yet) — consume the
-    // bytes to stay in sync and surface NULL. DECIMAL/NUMERIC/MONEY cover exact numerics (the DoD).
-    if (t == T_FLT8) { cskip(c, 8); return db.dbNull(); }
-    if (t == T_FLT4) { cskip(c, 4); return db.dbNull(); }
+    // FLOAT: little-endian IEEE-754 (4 or 8 bytes), decoded via the runtime IEEE->string builtin (the
+    // same one the mysql driver uses). Previously deferred to NULL -- silent data loss on every real/float.
+    if (t == T_FLT8) { return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 8), 8))); }
+    if (t == T_FLT4) { return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 4), 4))); }
     if (t == T_FLTN) {
         let n = cu8(c);
         if (n == 0) { return db.dbNull(); }
-        cskip(c, n);
-        return db.dbNull();
+        if (n == 4) { return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 4), 4))); }
+        return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 8), 8)));
     }
     if (t == T_GUID) {
         let n = cu8(c);
         if (n == 0) { return db.dbNull(); }
-        return db.dbBlob(cbytes(c, n));
+        if (n != 16) { cskip(c, n); return db.dbNull(); }
+        return db.dbText(guidToString(cbytes(c, 16)));   // canonical UUID string, not raw bytes
     }
     // Unknown/unsupported -> best effort: stop the row cleanly by returning null.
     return db.dbNull();

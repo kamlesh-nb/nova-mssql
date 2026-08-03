@@ -101,3 +101,24 @@ fn test_error_rides_on_result(): void {
     assert.isTrue(db.errorExec(e).hasError());
     assert.isTrue(!db.ResultSet().hasError());
 }
+
+@test
+fn test_guid_string_format(): void {
+    // T3: UNIQUEIDENTIFIER 16 bytes {Data1(4 LE), Data2(2 LE), Data3(2 LE), Data4(8)} ->
+    // canonical 8-4-4-4-12. Storage bytes 00 11 22 33 | 44 55 | 66 77 | 88 99 | aa bb cc dd ee ff.
+    let g = bytes.alloc(16);
+    let vals = List<int>();
+    let hexpairs = "00112233445566778899aabbccddeeff";
+    let i = 0;
+    while (i < 16) {
+        let hi = mssqlHexNib(hexpairs[i*2]); let lo = mssqlHexNib(hexpairs[i*2+1]);
+        bytes.write_byte(g, i, hi*16 + lo); i = i + 1;
+    }
+    // Data1 reversed: 33221100, Data2 reversed: 5544, Data3 reversed: 7766, then 8899, aabbccddeeff.
+    assert.equalStr(mssql.guidToString(g as string), "33221100-5544-7766-8899-aabbccddeeff");
+}
+fn mssqlHexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 97 + 10; }
+    return 0;
+}
