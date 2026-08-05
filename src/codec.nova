@@ -1,0 +1,681 @@
+// codec — the MSSQL/TDS 7.4 wire CODEC (SRP: bytes <-> messages). Byte writers, TDS packet
+// framing + chunking, the request BUILDERS (PRELOGIN / LOGIN7 / SQLBatch / RPC sp_prepare/execute/
+// unprepare / ATTENTION), the read cursor (Cur), and the token-stream + typed-value DECODERS. Pure
+// over byte-buffer strings — the offline gate calls these directly; the connection (mssql.nova) wires
+// them to a live stream via proto. Type-code -> DbType mapping is delegated to typemap; the
+// LOGIN7 password obfuscation comes from auth.
+//
+// The wire body is LITTLE-endian; the TDS packet-header length is BIG-endian. TDS packet framing is
+// [type][status][len:be16][spid:be16][packetid][window]; the response is a self-describing token
+// stream (COLMETADATA / ROW / NBCROW / DONE / ERROR / ...), NOT fixed-layout rows.
+//
+// ⚠️ ALL cursor-based value decoding lives HERE (it is wire-decode): readValue/parseTypeInfo/
+// decodeTokens all need the `Cur` cursor, and decodeTokens calls readValue. typemap holds only the
+// cursor-free mapDbType (which codec calls) + the DbValue->SQL side — so the graph stays acyclic
+// (codec -> {typemap, auth}).
+import string;
+import list;
+import bytes;
+import db;
+import typemap;
+import auth;
+
+// --- byte writers (TDS body is LITTLE-endian; the packet header length is BE) ---
+fn b1(v: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, v & 255);
+    return p as string;
+}
+fn u16le(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, v & 255);
+    bytes.write_byte(p, 1, (v / 256) & 255);
+    return p as string;
+}
+fn u32le(v: long): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v % 256) as int);
+    bytes.write_byte(p, 1, ((v / 256) % 256) as int);
+    bytes.write_byte(p, 2, ((v / 65536) % 256) as int);
+    bytes.write_byte(p, 3, ((v / 16777216) % 256) as int);
+    return p as string;
+}
+// UTF-16LE encode an ASCII/Latin-1 string (each code unit -> 2 bytes, low then high=0).
+fn utf16le(s: string): string {
+    let n = s.length;
+    if (n == 0) { return ""; }
+    let p = bytes.alloc(n * 2);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(p, i * 2, s[i] & 255);
+        bytes.write_byte(p, i * 2 + 1, (s[i] / 256) & 255);
+        i = i + 1;
+    }
+    return p as string;
+}
+
+// --- TDS packet framing: [type][status][len:be16][spid:be16][packetid][window] ---
+pub const PKT_SQLBATCH: int = 1;
+const PKT_ATTENTION: int = 6;  // 0x06 -- cancel the request in progress
+pub const PKT_LOGIN7: int = 16;    // 0x10
+pub const PKT_PRELOGIN: int = 18;  // 0x12
+
+// An ATTENTION packet: an empty-payload TDS message of type 6 (EOM). Sent to cancel the in-flight
+// request on THIS connection (unlike Postgres, which cancels from a side connection).
+pub fn buildAttention(): string { return tdsPacket(PKT_ATTENTION, ""); }
+
+// The negotiated default TDS packet size (MS-TDS): messages larger than this are split.
+const TDS_DEFAULT_PACKET_SIZE: int = 4096;
+
+// T14: compute a TDS packet-header STATUS byte. EOM (0x01) marks the last packet of a message;
+// RESETCONNECTION (0x08, fResetConnection) tells the server to reset session state (SET options,
+// temp tables, open transaction) before running the batch — set by the pool on a reused connection.
+// (RFC status flags: EOM 0x01, IGNORE 0x02, RESETCONNECTION 0x08, RESETCONNECTIONSKIPTRAN 0x10.)
+// Pure/testable seam.
+pub fn statusByte(isEom: bool, reset: bool): int {
+    let s = if (isEom) 0x01 else 0x00;
+    if (reset) { s = s | 0x08; }
+    return s;
+}
+
+// Split a whole TDS MESSAGE into one or more packets of at most `packetSize` bytes each (header
+// included). Pure over byte buffers — emits the full multi-packet stream. Every packet carries the
+// same `msgType`; the STATUS byte is 0x00 ("normal") on all but the LAST packet, which is 0x01
+// ("EOM"). `packetId` increments 1-based (mod 256). A packet holds up to (packetSize - 8) payload
+// bytes. An empty payload still yields exactly one EOM packet (header only) — matching ATTENTION.
+// When `reset` is true the RESETCONNECTION bit (0x08) is OR'd into the FIRST packet's status only —
+// the reset applies to the whole message, and the server keys off the first packet.
+pub fn chunkTdsMessageReset(msgType: int, payload: string, packetSize: int, reset: bool): string {
+    let maxData = packetSize - 8;
+    if (maxData < 1) { maxData = 1; }
+    let total = payload.length;
+    if (total == 0) {
+        // Header-only EOM packet (e.g. ATTENTION): first packet is also last, so reset lands here too.
+        return b1(msgType) + b1(statusByte(true, reset)) + u16beStr(8) + b1(0) + b1(0) + b1(1) + b1(0);
+    }
+    let out = "";
+    let offset = 0;
+    let packetId = 1;
+    while (offset < total) {
+        let remaining = total - offset;
+        let chunk = if (remaining > maxData) maxData else remaining;
+        let last = offset + chunk >= total;
+        let first = offset == 0;
+        let status = statusByte(last, reset && first);
+        // Built from b1()/u16beStr() (each returns an owned string that the concat drains) — a raw
+        // `bytes.alloc(8) as string` intermediate is NOT drained and leaks its buffer.
+        // [type][status][len:be16 total incl header][spid:be16][packetid][window]
+        out = out + b1(msgType) + b1(status) + u16beStr(8 + chunk) + b1(0) + b1(0)
+            + b1(packetId & 255) + b1(0) + string.slice(payload, offset, offset + chunk);
+        offset = offset + chunk;
+        packetId = packetId + 1;   // masked to a byte on write; wraps mod 256
+    }
+    return out;
+}
+
+// Back-compat wrapper: chunk with no connection-reset pending.
+pub fn chunkTdsMessage(msgType: int, payload: string, packetSize: int): string {
+    return chunkTdsMessageReset(msgType, payload, packetSize, false);
+}
+
+// Frame a whole outgoing TDS message with an explicit reset flag, chunking at the default packet size.
+pub fn tdsPacketReset(ptype: int, payload: string, reset: bool): string {
+    return chunkTdsMessageReset(ptype, payload, TDS_DEFAULT_PACKET_SIZE, reset);
+}
+
+// Frame a whole outgoing TDS message, chunking at the default packet size. A payload that fits in a
+// single packet emits one EOM packet — byte-identical to the pre-chunking single-packet framing.
+pub fn tdsPacket(ptype: int, payload: string): string {
+    return tdsPacketReset(ptype, payload, false);
+}
+
+// --- PRELOGIN: option table {token, offset:be16, len:be16}... 0xFF, then data ---
+// `encrypt` advertises ENCRYPT_ON (1) so the server negotiates TLS; otherwise ENCRYPT_NOT_SUP (2)
+// for a cleartext login.
+pub fn buildPrelogin(encrypt: bool): string {
+    // VERSION(0)=6 bytes, ENCRYPTION(1)=1 byte, THREADID(3)=4 bytes.
+    let dataStart = 5 * 3 + 1;   // 3 options * 5-byte entries + 1 terminator
+    let oVer = dataStart;
+    let oEnc = oVer + 6;
+    let oThr = oEnc + 1;
+    let table = "";
+    table = table + b1(0) + u16beStr(oVer) + u16beStr(6);   // VERSION
+    table = table + b1(1) + u16beStr(oEnc) + u16beStr(1);   // ENCRYPTION
+    table = table + b1(3) + u16beStr(oThr) + u16beStr(4);   // THREADID
+    table = table + b1(255);                                 // TERMINATOR
+    let data = "";
+    data = data + b1(0) + b1(0) + b1(0) + b1(0) + b1(0) + b1(0);  // version 6 bytes
+    data = data + b1(if (encrypt) 1 else 2);                      // ENCRYPT_ON / ENCRYPT_NOT_SUP
+    data = data + b1(0) + b1(0) + b1(0) + b1(0);                  // threadid
+    return table + data;
+}
+fn u16beStr(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) & 255);
+    bytes.write_byte(p, 1, v & 255);
+    return p as string;
+}
+
+// --- LOGIN7 (MS-TDS 2.2.6.4). Fixed 94-byte header (36 + 58 offset/length block),
+// then the UTF-16LE variable data. Offsets are byte offsets from message start;
+// string lengths in the header are in CHARACTERS. ---
+pub fn buildLogin7(user: string, pw: string, database: string): string {
+    let hostname = "novadb";
+    let appname = "nova";
+    let cltintname = "nova";
+
+    let vHost = utf16le(hostname);
+    let vUser = utf16le(user);
+    let vPass = auth.obfuscatePassword(pw);
+    let vApp = utf16le(appname);
+    let vClt = utf16le(cltintname);
+    let vDb = utf16le(database);
+
+    let fixed = 94;
+    let oHost = fixed;
+    let oUser = oHost + vHost.length;
+    let oPass = oUser + vUser.length;
+    let oApp = oPass + vPass.length;
+    let oClt = oApp + vApp.length;
+    let oDb = oClt + vClt.length;
+    let total = oDb + vDb.length;
+
+    let h = "";
+    h = h + u32le(total as long);          // Length
+    h = h + u32le(1946157060);             // TDSVersion 0x74000004 (7.4)
+    h = h + u32le(4096);                   // PacketSize
+    h = h + u32le(0);                      // ClientProgVer
+    h = h + u32le(0);                      // ClientPID
+    h = h + u32le(0);                      // ConnectionID
+    h = h + b1(0) + b1(0) + b1(0) + b1(0); // OptionFlags1/2 + TypeFlags + OptionFlags3
+    h = h + u32le(0);                      // ClientTimeZone
+    h = h + u32le(0);                      // ClientLCID
+    // offset/length pairs (offset:u16, length-in-chars:u16)
+    h = h + u16le(oHost) + u16le(hostname.length);
+    h = h + u16le(oUser) + u16le(user.length);
+    h = h + u16le(oPass) + u16le(pw.length);
+    h = h + u16le(oApp) + u16le(appname.length);
+    h = h + u16le(0) + u16le(0);           // ServerName
+    h = h + u16le(0) + u16le(0);           // Unused / Extension
+    h = h + u16le(oClt) + u16le(cltintname.length);
+    h = h + u16le(0) + u16le(0);           // Language
+    h = h + u16le(oDb) + u16le(database.length);
+    h = h + b1(0) + b1(0) + b1(0) + b1(0) + b1(0) + b1(0);  // ClientID (MAC) 6 bytes
+    h = h + u16le(0) + u16le(0);           // SSPI
+    h = h + u16le(0) + u16le(0);           // AtchDBFile
+    h = h + u16le(0) + u16le(0);           // ChangePassword
+    h = h + u32le(0);                      // cbSSPILong
+
+    return h + vHost + vUser + vPass + vApp + vClt + vDb;
+}
+
+// --- SQLBatch: ALL_HEADERS (transaction descriptor) then the UTF-16LE SQL text ---
+pub fn buildSqlBatch(sql: string): string {
+    // ALL_HEADERS: TotalLength(4) + [HeaderLength(4)=18][Type(2)=0x0002][TxnDesc(8)][OutstandingReq(4)]
+    let allHeaders = "";
+    allHeaders = allHeaders + u32le(22);          // TotalLength = 4 + 18
+    allHeaders = allHeaders + u32le(18);          // this header's length
+    allHeaders = allHeaders + u16le(2);           // type = Transaction Descriptor
+    allHeaders = allHeaders + u32le(0) + u32le(0);// TxnDescriptor (8 bytes)
+    allHeaders = allHeaders + u32le(1);           // OutstandingRequestCount
+    return allHeaders + utf16le(sql);
+}
+
+// ============================================================================
+// D6: server-side prepared statements via TDS RPC (sp_prepare / sp_execute).
+// ============================================================================
+// PKT_RPC = 3. A parameterized statement is prepared once (sp_prepare, ProcID 11) — the server
+// parses/plans it and returns a handle — then run by handle (sp_execute, ProcID 12). Params are
+// declared + bound as NVARCHAR (the server implicit-converts to the target type), the TDS analogue
+// of PG's text-format Bind / MySQL's VAR_STRING binding.
+
+pub const PKT_RPC: int = 3;
+pub const SP_PREPARE: int = 11;
+pub const SP_EXECUTE: int = 12;
+const SP_UNPREPARE: int = 15;
+
+// The 22-byte ALL_HEADERS block shared by SQLBatch and RPC requests.
+fn rpcAllHeaders(): string {
+    return u32le(22) + u32le(18) + u16le(2) + u32le(0) + u32le(0) + u32le(1);
+}
+
+// An RPC parameter: name (B_VARCHAR, usually empty), status flag, then type info + value.
+// INTN (nullable int) parameter. `outParam` marks it BY-REF (status 0x01) so sp_prepare can
+// return the handle through it. A 4-byte int value.
+pub fn rpcParamIntN(outParam: bool, value: long): string {
+    let status = if (outParam) 1 else 0;
+    return b1(0) + b1(status) + b1(T_INTN) + b1(4) + b1(4) + u32le(value);
+}
+// NVARCHAR parameter (max byte-length 8000 -> nvarchar(4000)). Zero collation is accepted for
+// input params. Value = actual byte length (u16) + UTF-16LE bytes.
+pub fn rpcParamNVarchar(text: string): string {
+    let u = utf16le(text);
+    let collation = b1(0) + b1(0) + b1(0) + b1(0) + b1(0);
+    return b1(0) + b1(0) + b1(T_NVARCHAR) + u16le(8000) + collation + u16le(u.length) + u;
+}
+// NVARCHAR param carrying SQL NULL (actual length 0xFFFF).
+pub fn rpcParamNVarcharNull(): string {
+    let collation = b1(0) + b1(0) + b1(0) + b1(0) + b1(0);
+    return b1(0) + b1(0) + b1(T_NVARCHAR) + u16le(8000) + collation + u16le(65535);
+}
+
+// Build an RPC request for a system procedure by its well-known ProcID.
+pub fn buildRpc(procId: int, params: string): string {
+    return rpcAllHeaders() + u16le(65535) + u16le(procId) + u16le(0) + params;
+}
+
+// sp_unprepare(@handle): release a server-side prepared-statement handle (ProcID 15). One INTN
+// param carrying the handle returned by sp_prepare. Returns the RPC body (wrap in tdsPacket to send).
+pub fn buildUnprepare(handle: long): string {
+    return buildRpc(SP_UNPREPARE, rpcParamIntN(false, handle));
+}
+
+// Convert the seam's `$1..$N` placeholders to T-SQL `@P1..@PN`, and report the highest N seen.
+pub struct MsPrep {
+    pub sql: string,
+    pub nparams: int,
+    init(sql: string, nparams: int) { self.sql = sql; self.nparams = nparams; }
+}
+pub fn convertPlaceholders(sql: string): MsPrep {
+    let out = "";
+    let maxN = 0;
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        if (sql[i] == 36 && i + 1 < n && sql[i + 1] >= 49 && sql[i + 1] <= 57) {   // '$' + digit
+            out = out + "@P";
+            i = i + 1;
+            let numStart = i;
+            let num = 0;
+            while (i < n && sql[i] >= 48 && sql[i] <= 57) {
+                num = num * 10 + (sql[i] - 48);
+                out = out + string.slice(sql, i, i + 1);
+                i = i + 1;
+            }
+            if (num > maxN) { maxN = num; }
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return MsPrep(out, maxN);
+}
+// "@P1 nvarchar(4000),@P2 nvarchar(4000),..." for `n` params (empty if n == 0).
+pub fn paramDecl(n: int): string {
+    let out = "";
+    let i = 1;
+    while (i <= n) {
+        if (i > 1) { out = out + ","; }
+        out = out + `@P${i} nvarchar(4000)`;
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- read cursor over a decoded token-stream buffer (all LITTLE-endian) ---
+struct Cur {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+}
+fn cu8(c: Cur): int { let b = c.s[c.pos] & 255; c.pos = c.pos + 1; return b; }
+fn cu16(c: Cur): int { let a = cu8(c); let b = cu8(c); return a + b * 256; }
+fn cu32(c: Cur): long {
+    let a = cu8(c) as long; let b = cu8(c) as long; let cc = cu8(c) as long; let d = cu8(c) as long;
+    return a + b * 256 + cc * 65536 + d * 16777216;
+}
+fn cu64(c: Cur): long { let lo = cu32(c); let hi = cu32(c); return lo + hi * 4294967296; }
+fn cskip(c: Cur, n: int): void { c.pos = c.pos + n; }
+fn cbytes(c: Cur, n: int): string {
+    if (n <= 0) { return ""; }
+    let p = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(p, i, c.s[c.pos + i] & 255); i = i + 1; }
+    c.pos = c.pos + n;
+    return p as string;
+}
+fn cremaining(c: Cur): int { return c.s.length - c.pos; }
+
+fn s16(v: int): int { if (v >= 32768) { return v - 65536; } return v; }
+fn s32(v: long): long { if (v >= 2147483648) { return v - 4294967296; } return v; }
+fn s64(v: long): long { return v; }   // already carried in a 64-bit word
+
+// UTF-16LE -> a Nova UTF-8 string (BMP; surrogates emitted as replacement).
+fn utf16leDecode(raw: string): string {
+    let n = raw.length;
+    let out = bytes.alloc(n * 3 + 1);   // worst case 3 bytes/unit
+    let oi = 0;
+    let i = 0;
+    while (i + 1 < n) {
+        let cp = (raw[i] & 255) + (raw[i + 1] & 255) * 256;
+        i = i + 2;
+        if (cp < 128) {
+            bytes.write_byte(out, oi, cp); oi = oi + 1;
+        } else if (cp < 2048) {
+            bytes.write_byte(out, oi, 192 + (cp / 64)); oi = oi + 1;
+            bytes.write_byte(out, oi, 128 + (cp & 63)); oi = oi + 1;
+        } else {
+            bytes.write_byte(out, oi, 224 + (cp / 4096)); oi = oi + 1;
+            bytes.write_byte(out, oi, 128 + ((cp / 64) & 63)); oi = oi + 1;
+            bytes.write_byte(out, oi, 128 + (cp & 63)); oi = oi + 1;
+        }
+    }
+    let r = bytes.read_string(out, oi);   // copies into a fresh Nova string
+    bytes.free(out);                      // the scratch buffer is ours to free
+    return r;
+}
+
+// --- TDS type codes ---
+const T_INT1: int = 48;     // 0x30 tinyint
+const T_INT2: int = 52;     // 0x34 smallint
+const T_INT4: int = 56;     // 0x38 int
+const T_INT8: int = 127;    // 0x7F bigint
+const T_INTN: int = 38;     // 0x26
+const T_BIT: int = 50;      // 0x32
+const T_BITN: int = 104;    // 0x68
+const T_FLT4: int = 59;     // 0x3B
+const T_FLT8: int = 62;     // 0x3E
+const T_FLTN: int = 109;    // 0x6D
+const T_MONEY: int = 60;    // 0x3C
+const T_MONEY4: int = 122;  // 0x7A
+const T_MONEYN: int = 110;  // 0x6E
+const T_DECIMAL: int = 55;  // 0x37
+const T_NUMERIC: int = 63;  // 0x3F
+const T_DECIMALN: int = 106;// 0x6A
+const T_NUMERICN: int = 108;// 0x6C
+const T_BIGVARCHR: int = 167;// 0xA7
+const T_BIGCHAR: int = 175; // 0xAF
+const T_NVARCHAR: int = 231;// 0xE7
+const T_NCHAR: int = 239;   // 0xEF
+const T_BIGVARBIN: int = 165;// 0xA5
+const T_BIGBINARY: int = 173;// 0xAD
+const T_GUID: int = 36;     // 0x24
+
+struct ColType {
+    pub t: int,
+    pub len: int,
+    pub precision: int,
+    pub scale: int,
+    init(t: int) { self.t = t; self.len = 0; self.precision = 0; self.scale = 0; }
+}
+
+// Parse a TYPE_INFO block (in COLMETADATA), consuming exactly its bytes.
+fn parseTypeInfo(c: Cur): ColType {
+    let t = cu8(c);
+    let ct = ColType(t);
+    if (t == T_INTN || t == T_BITN || t == T_FLTN || t == T_MONEYN || t == T_GUID) {
+        ct.len = cu8(c);
+    } else if (t == T_DECIMAL || t == T_NUMERIC || t == T_DECIMALN || t == T_NUMERICN) {
+        ct.len = cu8(c);
+        ct.precision = cu8(c);
+        ct.scale = cu8(c);
+    } else if (t == T_BIGVARCHR || t == T_BIGCHAR || t == T_NVARCHAR || t == T_NCHAR) {
+        ct.len = cu16(c);
+        cskip(c, 5);            // collation
+    } else if (t == T_BIGVARBIN || t == T_BIGBINARY) {
+        ct.len = cu16(c);
+    }
+    return ct;
+}
+
+// Insert a decimal point `scale` places from the right of an integer digit string,
+// PRESERVING trailing zeros (so DECIMAL(12,4) 199900 -> "19.9900", not "19.99").
+fn insertPoint(digits: string, scale: int): string {
+    if (scale <= 0) { return digits; }
+    let L = digits.length;
+    if (L <= scale) {
+        let z = "";
+        let k = 0;
+        while (k < scale - L) { z = z + "0"; k = k + 1; }
+        return "0." + z + digits;
+    }
+    return string.slice(digits, 0, L - scale) + "." + string.slice(digits, L - scale, L);
+}
+// Give an INTEGER-valued decimal its `scale` — via text, so the declared scale (trailing
+// zeros) survives. Dividing by 10^scale would strip to the preferred exponent.
+fn scaleDecimal(intVal: decimal, scale: int): decimal {
+    let s = `${intVal}`;
+    let neg = false;
+    if (s.length > 0 && s[0] == 45) { neg = true; s = string.slice(s, 1, s.length); }  // '-'
+    let text = insertPoint(s, scale);
+    if (neg) { text = "-" + text; }
+    return decimal.fromString(text);
+}
+
+// Build a decimal from a magnitude (little-endian bytes) + sign + scale.
+fn decodeDecimal(mag: string, negative: bool, scale: int): decimal {
+    let v = 0m;
+    let base = 1m;
+    let i = 0;
+    while (i < mag.length) {
+        v = v + decimal.fromInt(mag[i] & 255) * base;
+        base = base * 256m;
+        i = i + 1;
+    }
+    if (negative) { v = 0m - v; }
+    return scaleDecimal(v, scale);
+}
+
+// Read one ROW value for a column type. Returns dbNull() for NULLs.
+fn hexch(v: int): int { if (v < 10) { return 48 + v; } return 97 + (v - 10); }
+fn hex2(b: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, hexch((b / 16) & 15));
+    bytes.write_byte(p, 1, hexch(b & 15));
+    return p as string;
+}
+// SQL Server UNIQUEIDENTIFIER stores {Data1(4 LE), Data2(2 LE), Data3(2 LE), Data4(8)}. Render the
+// canonical 8-4-4-4-12 UUID string (the first three groups are byte-reversed from storage).
+pub fn guidToString(raw: string): string {
+    let g1 = hex2(raw[3]) + hex2(raw[2]) + hex2(raw[1]) + hex2(raw[0]);
+    let g2 = hex2(raw[5]) + hex2(raw[4]);
+    let g3 = hex2(raw[7]) + hex2(raw[6]);
+    let g4 = hex2(raw[8]) + hex2(raw[9]);
+    let g5 = hex2(raw[10]) + hex2(raw[11]) + hex2(raw[12]) + hex2(raw[13]) + hex2(raw[14]) + hex2(raw[15]);
+    return `${g1}-${g2}-${g3}-${g4}-${g5}`;
+}
+
+fn readValue(c: Cur, ct: ColType): DbValue {
+    let t = ct.t;
+    if (t == T_INT1) { return db.dbInt(cu8(c)); }
+    if (t == T_INT2) { return db.dbInt(s16(cu16(c))); }
+    if (t == T_INT4) { return db.dbInt(s32(cu32(c)) as int); }
+    if (t == T_INT8) { return db.dbLong(s64(cu64(c))); }
+    if (t == T_BIT) { return db.dbBool(cu8(c) != 0); }
+    if (t == T_INTN) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        if (n == 1) { return db.dbInt(cu8(c)); }
+        if (n == 2) { return db.dbInt(s16(cu16(c))); }
+        if (n == 4) { return db.dbInt(s32(cu32(c)) as int); }
+        return db.dbLong(s64(cu64(c)));
+    }
+    if (t == T_BITN) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        return db.dbBool(cu8(c) != 0);
+    }
+    if (t == T_NVARCHAR || t == T_NCHAR) {
+        let n = cu16(c);
+        if (n == 65535) { return db.dbNull(); }
+        return db.dbText(utf16leDecode(cbytes(c, n)));
+    }
+    if (t == T_BIGVARCHR || t == T_BIGCHAR) {
+        let n = cu16(c);
+        if (n == 65535) { return db.dbNull(); }
+        return db.dbText(cbytes(c, n));   // single-byte codepage -> as-is
+    }
+    if (t == T_BIGVARBIN || t == T_BIGBINARY) {
+        let n = cu16(c);
+        if (n == 65535) { return db.dbNull(); }
+        return db.dbBlob(cbytes(c, n));
+    }
+    if (t == T_DECIMAL || t == T_NUMERIC || t == T_DECIMALN || t == T_NUMERICN) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        let sign = cu8(c);                 // 1 = positive, 0 = negative
+        let mag = cbytes(c, n - 1);
+        return db.dbDecimal(decodeDecimal(mag, sign == 0, ct.scale));
+    }
+    if (t == T_MONEYN) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        if (n == 4) { return db.dbDecimal(decodeMoney4(c)); }
+        return db.dbDecimal(decodeMoney8(c));
+    }
+    if (t == T_MONEY) { return db.dbDecimal(decodeMoney8(c)); }
+    if (t == T_MONEY4) { return db.dbDecimal(decodeMoney4(c)); }
+    // FLOAT: little-endian IEEE-754 (4 or 8 bytes), decoded via the runtime IEEE->string builtin (the
+    // same one the mysql driver uses). Previously deferred to NULL -- silent data loss on every real/float.
+    if (t == T_FLT8) { return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 8), 8))); }
+    if (t == T_FLT4) { return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 4), 4))); }
+    if (t == T_FLTN) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        if (n == 4) { return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 4), 4))); }
+        return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(cbytes(c, 8), 8)));
+    }
+    if (t == T_GUID) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        if (n != 16) { cskip(c, n); return db.dbNull(); }
+        return db.dbUuid(guidToString(cbytes(c, 16)));   // canonical UUID string
+    }
+    // Unknown/unsupported -> best effort: stop the row cleanly by returning null.
+    return db.dbNull();
+}
+
+// MONEY: two 4-byte halves, HIGH dword first; value = int64 / 10000.
+fn decodeMoney8(c: Cur): decimal {
+    // MONEY: HIGH dword first, then LOW dword; the pair is a signed int64 / 10000.
+    let hi = cu32(c);
+    let lo = cu32(c);
+    let mag = decimal.fromInt(hi) * 4294967296m + decimal.fromInt(lo);
+    // sign from the high dword's top bit (int64 two's complement).
+    if (hi >= 2147483648) { mag = mag - 18446744073709551616m; }
+    return scaleDecimal(mag, 4);   // MONEY has 4 implied decimal places
+}
+fn decodeMoney4(c: Cur): decimal {
+    let v = s32(cu32(c));
+    return scaleDecimal(decimal.fromInt(v), 4);
+}
+
+// --- token-stream decode ---
+pub struct MsResult {
+    pub ok: bool,
+    pub err: string,
+    pub rs: ResultSet,
+    pub affected: long,
+    pub retval: long,        // D6: an sp_prepare RETURNVALUE (the prepared-statement handle)
+    init() { self.ok = true; self.err = ""; self.rs = ResultSet(); self.affected = 0; self.retval = 0; }
+}
+
+// B_VARCHAR: len(1) chars, UTF-16LE. US_VARCHAR: len(2) chars, UTF-16LE.
+fn bVarchar(c: Cur): string { let n = cu8(c); return utf16leDecode(cbytes(c, n * 2)); }
+fn usVarchar(c: Cur): string { let n = cu16(c); return utf16leDecode(cbytes(c, n * 2)); }
+
+pub fn decodeTokens(stream: string): MsResult {
+    let res = MsResult();
+    let c = Cur(stream);
+    let cols = List<ColType>();
+    let n = stream.length;
+    while (c.pos < n) {
+        let tok = cu8(c);
+        if (tok == 129) {                 // 0x81 COLMETADATA
+            cols = List<ColType>();
+            res.rs.columns = List<Column>();
+            let count = cu16(c);
+            if (count != 65535) {
+                let i = 0;
+                while (i < count) {
+                    cskip(c, 4);          // UserType
+                    cskip(c, 2);          // Flags
+                    let ct = parseTypeInfo(c);
+                    let name = bVarchar(c);
+                    cols.push(ct);
+                    res.rs.columns.push(Column(name, typemap.mapDbType(ct.t)));
+                    i = i + 1;
+                }
+            }
+        } else if (tok == 209) {          // 0xD1 ROW
+            let row = Row();
+            let i = 0;
+            while (i < cols.size()) {
+                row.cells.push(readValue(c, cols.get(i) ?? ColType(0)));
+                i = i + 1;
+            }
+            res.rs.rows.push(row);
+        } else if (tok == 210) {          // 0xD2 NBCROW (null-bitmap-compressed row)
+            // Sent instead of ROW when the row has any NULLs: a null bitmap (1 bit per column,
+            // LSB-first) then a value for each NON-null column only.
+            let ncol = cols.size();
+            let bm = cbytes(c, (ncol + 7) / 8);
+            let row = Row();
+            let i = 0;
+            while (i < ncol) {
+                let nb = bytes.read_byte(bm, i / 8) & 255;
+                if ((nb / (1 << (i % 8))) % 2 == 1) {
+                    row.cells.push(db.dbNull());
+                } else {
+                    row.cells.push(readValue(c, cols.get(i) ?? ColType(0)));
+                }
+                i = i + 1;
+            }
+            res.rs.rows.push(row);
+        } else if (tok == 170 || tok == 171) {   // 0xAA ERROR / 0xAB INFO
+            let len = cu16(c);
+            let start = c.pos;
+            let number = cu32(c);
+            cskip(c, 2);                  // state + class
+            let msg = usVarchar(c);
+            if (tok == 170) { res.ok = false; res.err = msg; }
+            c.pos = start + len;          // skip the rest (server/proc/line)
+        } else if (tok == 173) {          // 0xAD LOGINACK
+            let len = cu16(c);
+            cskip(c, len);
+        } else if (tok == 227) {          // 0xE3 ENVCHANGE
+            let len = cu16(c);
+            cskip(c, len);
+        } else if (tok == 169) {          // 0xA9 ORDER
+            let len = cu16(c);
+            cskip(c, len);
+        } else if (tok == 121) {          // 0x79 RETURNSTATUS
+            cskip(c, 4);
+        } else if (tok == 172) {          // 0xAC RETURNVALUE (sp_prepare's @handle OUTPUT)
+            cskip(c, 2);                  // param ordinal
+            bVarchar(c);                  // param name
+            cskip(c, 1);                  // status
+            cskip(c, 4);                  // UserType (TDS 7.2+)
+            cskip(c, 2);                  // Flags
+            let ct = parseTypeInfo(c);
+            let v = readValue(c, ct);
+            res.retval = v.asLong();
+        } else if (tok == 253 || tok == 254 || tok == 255) {  // DONE / DONEPROC / DONEINPROC
+            cskip(c, 2);                  // status
+            cskip(c, 2);                  // curcmd
+            let rc = cu64(c);             // rowcount (TDS 7.2+: 8 bytes)
+            res.affected = rc;
+        } else {
+            // Unknown token — cannot safely resync; stop.
+            return res;
+        }
+    }
+    return res;
+}
+
+// The server's PRELOGIN ENCRYPTION response byte (0=OFF,1=ON,2=NOT_SUP,3=REQ); -1 if absent.
+pub fn preloginEncryption(pre: string): int {
+    let n = pre.length;
+    let i = 0;
+    while (i + 5 <= n) {
+        let tok = pre[i] & 255;
+        if (tok == 255) { return -1; }             // TERMINATOR
+        let off = (pre[i + 1] & 255) * 256 + (pre[i + 2] & 255);
+        if (tok == 1) {                             // ENCRYPTION option
+            if (off < n) { return pre[off] & 255; }
+            return -1;
+        }
+        i = i + 5;
+    }
+    return -1;
+}

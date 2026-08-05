@@ -2,7 +2,8 @@
 // byte buffers, no server. Covers: the LOGIN7 password obfuscation (nibble-swap + XOR 0xA5,
 // UTF-16LE), the PRELOGIN encryption advertisement, and a COLMETADATA/ROW/DONE token-stream
 // decode into typed DbValues (INT via INTN, NVARCHAR unicode, NUMERIC exact decimal).
-import mssql;
+import codec;
+import auth;
 import db;
 import bytes;
 import list;
@@ -23,7 +24,7 @@ fn push(l: List<int>, v: int): void { l.push(v); }
 @test
 fn test_password_obfuscation(): void {
     // reference vector: obf("test") = E2 A5 F3 A5 92 A5 E2 A5  (verified vs a Python impl)
-    let o = mssql.obfuscatePassword("test");
+    let o = auth.obfuscatePassword("test");
     assert.equalInt(o.length, 8);
     assert.equalInt(o[0] & 255, 226);  // E2
     assert.equalInt(o[1] & 255, 165);  // A5
@@ -35,7 +36,7 @@ fn test_password_obfuscation(): void {
 
 @test
 fn test_prelogin_advertises_not_sup(): void {
-    let pre = mssql.buildPrelogin(false);
+    let pre = codec.buildPrelogin(false);
     // option table: VERSION(0)+ENCRYPTION(1)+THREADID(3)+terminator(0xFF) = 16 bytes, then data.
     // ENCRYPTION option entry is at bytes [5..10): token=1, then be16 offset, be16 len=1.
     assert.equalInt(pre[5] & 255, 1);          // ENCRYPTION token
@@ -45,7 +46,7 @@ fn test_prelogin_advertises_not_sup(): void {
 
 @test
 fn test_login7_shape(): void {
-    let l = mssql.buildLogin7("sa", "pw", "master");
+    let l = codec.buildLogin7("sa", "pw", "master");
     // first 4 bytes = total length (LE) == the whole buffer length.
     let total = (l[0] & 255) + (l[1] & 255) * 256 + (l[2] & 255) * 65536;
     assert.equalInt(total, l.length);
@@ -80,7 +81,7 @@ fn test_token_stream_row_decode(): void {
     push(s, 253); push(s, 0); push(s, 0); push(s, 0); push(s, 0);
     push(s, 1); push(s, 0); push(s, 0); push(s, 0); push(s, 0); push(s, 0); push(s, 0); push(s, 0);
 
-    let r = mssql.decodeTokens(hx(s));
+    let r = codec.decodeTokens(hx(s));
     assert.isTrue(r.ok);
     assert.equalInt(r.rs.rowCount(), 1);
     assert.equalInt(r.rs.colCount(), 3);
@@ -115,7 +116,7 @@ fn test_guid_string_format(): void {
         bytes.write_byte(g, i, hi*16 + lo); i = i + 1;
     }
     // Data1 reversed: 33221100, Data2 reversed: 5544, Data3 reversed: 7766, then 8899, aabbccddeeff.
-    assert.equalStr(mssql.guidToString(g as string), "33221100-5544-7766-8899-aabbccddeeff");
+    assert.equalStr(codec.guidToString(g as string), "33221100-5544-7766-8899-aabbccddeeff");
 }
 fn mssqlHexNib(c: int): int {
     if (c >= 48 && c <= 57) { return c - 48; }
@@ -126,7 +127,7 @@ fn mssqlHexNib(c: int): int {
 @test
 fn test_attention_packet(): void {
     // T8: ATTENTION is an empty TDS message of type 6, EOM status, 8-byte header.
-    let a = mssql.buildAttention();
+    let a = codec.buildAttention();
     assert.equalInt(a.length, 8);      // header only, no payload
     assert.equalInt(a[0], 6);          // packet type = ATTENTION
     assert.equalInt(a[1], 1);          // status = EOM
@@ -139,7 +140,7 @@ fn test_chunk_large_message(): void {
     let payload = bytes.alloc(5000);
     let i = 0;
     while (i < 5000) { bytes.write_byte(payload, i, i & 255); i = i + 1; }
-    let out = mssql.chunkTdsMessage(1, payload as string, 512);
+    let out = codec.chunkTdsMessage(1, payload as string, 512);
 
     let pos = 0;
     let count = 0;
@@ -176,7 +177,7 @@ fn test_chunk_single_packet(): void {
     let payload = bytes.alloc(100);
     let i = 0;
     while (i < 100) { bytes.write_byte(payload, i, 65); i = i + 1; }
-    let out = mssql.chunkTdsMessage(1, payload as string, 4096);
+    let out = codec.chunkTdsMessage(1, payload as string, 4096);
     assert.equalInt(out.length, 108);          // one 8-byte header + 100 payload
     assert.equalInt(out[1] & 255, 1);          // EOM status
     assert.equalInt(out[6] & 255, 1);          // packetId 1
@@ -187,10 +188,10 @@ fn test_chunk_single_packet(): void {
 @test
 fn test_status_byte_reset(): void {
     // T14: statusByte seam — EOM 0x01, RESETCONNECTION 0x08, combined 0x09.
-    assert.equalInt(mssql.statusByte(true, false), 0x01);   // EOM only
-    assert.equalInt(mssql.statusByte(true, true), 0x09);    // EOM + RESETCONNECTION
-    assert.equalInt(mssql.statusByte(false, true), 0x08);   // RESETCONNECTION only (not EOM)
-    assert.equalInt(mssql.statusByte(false, false), 0x00);  // normal
+    assert.equalInt(codec.statusByte(true, false), 0x01);   // EOM only
+    assert.equalInt(codec.statusByte(true, true), 0x09);    // EOM + RESETCONNECTION
+    assert.equalInt(codec.statusByte(false, true), 0x08);   // RESETCONNECTION only (not EOM)
+    assert.equalInt(codec.statusByte(false, false), 0x00);  // normal
 }
 
 @test
@@ -199,11 +200,11 @@ fn test_reset_single_packet(): void {
     let payload = bytes.alloc(100);
     let i = 0;
     while (i < 100) { bytes.write_byte(payload, i, 65); i = i + 1; }
-    let out = mssql.chunkTdsMessageReset(1, payload as string, 4096, true);
+    let out = codec.chunkTdsMessageReset(1, payload as string, 4096, true);
     assert.equalInt(out[1] & 255, 0x09);       // first (=last) packet: EOM | RESETCONNECTION
     assert.equalInt(out[6] & 255, 1);          // packetId 1
     // Without reset, the same payload is plain EOM (0x01) — no reset bit leaks in.
-    let plain = mssql.chunkTdsMessageReset(1, payload as string, 4096, false);
+    let plain = codec.chunkTdsMessageReset(1, payload as string, 4096, false);
     assert.equalInt(plain[1] & 255, 0x01);
 }
 
@@ -214,7 +215,7 @@ fn test_reset_first_packet_only(): void {
     let payload = bytes.alloc(5000);
     let i = 0;
     while (i < 5000) { bytes.write_byte(payload, i, 66); i = i + 1; }
-    let out = mssql.chunkTdsMessageReset(1, payload as string, 512, true);
+    let out = codec.chunkTdsMessageReset(1, payload as string, 512, true);
     // First packet: RESETCONNECTION set, not EOM (more packets follow) -> 0x08.
     assert.equalInt(out[1] & 255, 0x08);
     assert.equalInt(out[6] & 255, 1);          // packetId 1

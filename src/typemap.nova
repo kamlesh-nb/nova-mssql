@@ -1,0 +1,64 @@
+// typemap — type mapping between MSSQL's TDS wire types and the `db` seam
+// (SRP: types & values only, cursor-free). Three jobs:
+//   - TDS type code -> DbType            (mapDbType)
+//   - DbValue -> NVARCHAR bind text       (msValueText)
+//   - DbValue -> inline SQL literal        (substituteParams / literalOf)
+// Pure over strings + the db value model; no socket, no framing, NO cursor. The cursor-based value
+// decoders (readValue et al., which need the byte cursor Cur) live in codec, alongside the wire
+// framing they belong to — putting them here would force an import of codec (for Cur) while
+// codec imports this module (for mapDbType), which would be a cycle.
+import string;
+import list;
+import db;
+
+// --- TDS type code -> seam DbType ---------------------------------------------
+// The wire type-code constants (T_*) live in codec (where the cursor value-decoders use them);
+// this cursor-free mapping duplicates their VALUES as integer literals so typemap stays free of
+// any dependency on codec (the codec->typemap edge must remain acyclic).
+pub fn mapDbType(t: int): DbType {
+    if (t == 48 || t == 52 || t == 56 || t == 38) { return DbType.Int4; }      // INT1/INT2/INT4/INTN
+    if (t == 127) { return DbType.Int8; }                                       // INT8
+    if (t == 50 || t == 104) { return DbType.Bool; }                            // BIT/BITN
+    if (t == 59 || t == 62 || t == 109) { return DbType.Float8; }               // FLT4/FLT8/FLTN
+    if (t == 55 || t == 63 || t == 106 || t == 108) { return DbType.Decimal; }  // DECIMAL/NUMERIC(+N)
+    if (t == 60 || t == 122 || t == 110) { return DbType.Decimal; }             // MONEY/MONEY4/MONEYN
+    if (t == 165 || t == 173) { return DbType.Blob; }                           // BIGVARBIN/BIGBINARY
+    return DbType.Text;
+}
+
+// --- DbValue -> NVARCHAR bind text --------------------------------------------
+// A bound parameter as an NVARCHAR value (the server implicit-converts). NULL -> a NULL NVARCHAR.
+pub fn msValueText(v: DbValue): string {
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "1"; } return "0"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return v.asText(); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+
+// --- DbValue -> inline SQL literal (client-side `?` substitution) -------------
+pub fn substituteParams(sql: string, params: List<DbValue>): string {
+    // Positional `?` -> literal (parity with the other drivers' naive substitution).
+    let out = "";
+    let pi = 0;
+    let i = 0;
+    while (i < sql.length) {
+        if (sql[i] == 63 && pi < params.size()) {   // '?'
+            out = out + literalOf(params.get(pi) ?? db.dbNull());
+            pi = pi + 1;
+        } else {
+            out = out + charAt(sql, i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+fn charAt(s: string, i: int): string { return string.slice(s, i, i + 1); }
+fn literalOf(v: DbValue): string {
+    if (v.kind == DbType.Null) { return "NULL"; }
+    if (v.kind == DbType.Text) { return "'" + v.asText() + "'"; }
+    if (v.kind == DbType.Bool) { return if (v.asBool()) "1" else "0"; }
+    if (v.kind == DbType.Decimal) { return `${v.asDecimal()}`; }
+    return `${v.asLong()}`;
+}

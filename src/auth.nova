@@ -1,0 +1,39 @@
+// auth — the TDS login password obfuscation (SRP: auth only).
+// TDS password obfuscation (MS-TDS 2.2.6.4): UTF-16LE, then per byte swap the nibbles and XOR 0xA5.
+// Reversible, fixed — this is NOT encryption. Public so the driver's codec gate can golden-verify it;
+// codec.buildLogin7 calls obfuscatePassword to obfuscate the password field (a one-way codec->auth
+// edge). No dependency on codec (keeps the module graph acyclic), so the small UTF-16LE writer is
+// duplicated here rather than imported.
+import bytes;
+import string;
+
+// UTF-16LE encode an ASCII/Latin-1 string (each code unit -> 2 bytes, low then high=0).
+fn utf16le(s: string): string {
+    let n = s.length;
+    if (n == 0) { return ""; }
+    let p = bytes.alloc(n * 2);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(p, i * 2, s[i] & 255);
+        bytes.write_byte(p, i * 2 + 1, (s[i] / 256) & 255);
+        i = i + 1;
+    }
+    return p as string;
+}
+
+// TDS password obfuscation (MS-TDS 2.2.6.4): UTF-16LE, then per byte swap the
+// nibbles and XOR 0xA5. Reversible, fixed — this is NOT encryption.
+pub fn obfuscatePassword(pw: string): string {
+    let u = utf16le(pw);
+    let n = u.length;
+    if (n == 0) { return ""; }
+    let p = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        let bb = u[i] & 255;
+        let swapped = ((bb * 16) & 255) + (bb / 16);
+        bytes.write_byte(p, i, swapped ^ 165);   // 0xA5
+        i = i + 1;
+    }
+    return p as string;
+}

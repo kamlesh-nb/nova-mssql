@@ -10,7 +10,7 @@ import bytes;
 import string;
 import list;
 import db;
-import mssql;
+import codec;
 
 fn b(vals: List<int>): string {
     let p = bytes.alloc(vals.size());
@@ -21,21 +21,21 @@ fn b(vals: List<int>): string {
 
 @test
 fn test_placeholder_rewrite(): void {
-    let m = mssql.convertPlaceholders("SELECT $1 AS a, $2 AS b WHERE x = $1");
+    let m = codec.convertPlaceholders("SELECT $1 AS a, $2 AS b WHERE x = $1");
     assert.equalStr(m.sql, "SELECT @P1 AS a, @P2 AS b WHERE x = @P1");
     assert.equalInt(m.nparams, 2);      // highest N seen
 }
 
 @test
 fn test_param_declaration(): void {
-    assert.equalStr(mssql.paramDecl(2), "@P1 nvarchar(4000),@P2 nvarchar(4000)");
-    assert.equalStr(mssql.paramDecl(0), "");
+    assert.equalStr(codec.paramDecl(2), "@P1 nvarchar(4000),@P2 nvarchar(4000)");
+    assert.equalStr(codec.paramDecl(0), "");
 }
 
 @test
 fn test_rpc_intn_param(): void {
     // INTN out-param: [name len 0][status 1][type 0x26][maxlen 4][actual 4][value u32]
-    let p = mssql.rpcParamIntN(true, 7);
+    let p = codec.rpcParamIntN(true, 7);
     assert.equalInt(p[0], 0);           // name length
     assert.equalInt(p[1], 1);           // status = OUTPUT
     assert.equalInt(p[2], 38);          // 0x26 INTN
@@ -47,7 +47,7 @@ fn test_rpc_intn_param(): void {
 @test
 fn test_rpc_nvarchar_param(): void {
     // NVARCHAR: [name 0][status 0][type 0xE7][maxlen u16][collation 5][actual u16][utf16 bytes]
-    let p = mssql.rpcParamNVarchar("hi");
+    let p = codec.rpcParamNVarchar("hi");
     assert.equalInt(p[2], 231);         // 0xE7 NVARCHAR
     // actual length (u16) sits after 1+1+1+2+5 = 10 header bytes -> index 10 = 4 bytes ("hi" utf16)
     assert.equalInt(p[10], 4);
@@ -59,7 +59,7 @@ fn test_rpc_nvarchar_param(): void {
 @test
 fn test_rpc_frame_procid(): void {
     // buildRpc: ALL_HEADERS(22) then [0xFFFF][procId u16][flags u16][params]
-    let f = mssql.buildRpc(11, "");       // SP_PREPARE = 11
+    let f = codec.buildRpc(11, "");       // SP_PREPARE = 11
     // after 22-byte ALL_HEADERS: 0xFF 0xFF
     assert.equalInt(f[22], 255);
     assert.equalInt(f[23], 255);
@@ -70,7 +70,7 @@ fn test_rpc_frame_procid(): void {
 fn test_sp_unprepare_rpc(): void {
     // T14: sp_unprepare (ProcID 15) releases a prepared handle. RPC = ALL_HEADERS(22) then
     // [0xFFFF][procId=15 u16][flags u16][one INTN param carrying the handle].
-    let f = mssql.buildUnprepare(9);
+    let f = codec.buildUnprepare(9);
     assert.equalInt(f[22], 255);          // 0xFFFF (name-by-procid)
     assert.equalInt(f[23], 255);
     assert.equalInt(f[24], 15);           // ProcID 15 = sp_unprepare (low byte)
@@ -106,7 +106,7 @@ fn test_nbcrow_decode_with_null(): void {
     s.push(1); s.push(0); s.push(0); s.push(0); s.push(0); s.push(0); s.push(0); s.push(0);
 
     let stream = b(s);
-    let r = mssql.decodeTokens(stream);
+    let r = codec.decodeTokens(stream);
     assert.isTrue(r.ok);
     assert.equalInt(r.rs.columns.size(), 2);
     assert.equalInt(r.rs.rows.size(), 1);          // BUG WAS: NBCROW ignored -> 0 rows

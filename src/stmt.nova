@@ -1,0 +1,10 @@
+// stmt — the server-side prepared-statement cache entry (SRP: statement identity).
+// A prepared statement: the server handle from sp_prepare + the SQL (for the dedup cache). The
+// sp_prepare / sp_execute wire frames live in codec; the prepare/queryPrepared/execPrepared
+// orchestration lives on the connection (mssql.nova). This is just the cached handle model.
+
+pub struct MsStmt {
+    pub handle: long,
+    pub sql: string,
+    init(handle: long, sql: string) { self.handle = handle; self.sql = sql; }
+}

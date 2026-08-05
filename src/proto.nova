@@ -1,0 +1,77 @@
+// proto — the async transport framing (SRP: read/write whole TDS messages off a live stream).
+// Buffered reader over an AsyncIO; the socket I/O is non-blocking — `tfill` awaits `io.recvInto`,
+// which PARKS the coroutine (asio arecv) instead of blocking the scheduler thread. `io` is an
+// AsyncStream (cleartext) or an asynctls.TlsStream (once the TDS-tunneled TLS handshake completes;
+// every packet from LOGIN7 on is then TLS-protected). Knows the TDS packet framing
+// ([type][status][len:be16][spid:be16][packetid][window] + EOM reassembly) only — payload MEANING
+// lives in codec.
+import net.aio;
+import bytes;
+
+// --- buffered TDS packet reader over a live TCP stream (raw or TLS-tunneled) ---
+// A1 async-first seam: the reader's transport is an `aio.AsyncIO` — AsyncStream (cleartext)
+// or asynctls.TlsStream (once the TDS-tunneled TLS handshake completes; every packet from LOGIN7
+// on is then TLS-protected, and TlsStream's recvInto/sendStr do the raw post-handshake TLS).
+pub struct TdsReader {
+    pub io: aio.AsyncIO,
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: aio.AsyncIO) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+    pub fn delete(self: TdsReader): void { bytes.free(self.buf); }
+}
+async fn tfill(r: TdsReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) { bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i)); i = i + 1; }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let cn = await r.io.recvInto((r.buf + r.len) as int, r.cap - r.len);   // parks; cleartext or TLS
+    if (cn <= 0) { return false; }
+    r.len = r.len + cn;
+    return true;
+}
+async fn tneed(r: TdsReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await tfill(r))) { return false; } }
+    return true;
+}
+
+// Read one full TDS MESSAGE (reassemble packets until the EOM status bit).
+pub async fn readMessage(r: TdsReader): string {
+    let out = "";
+    while (true) {
+        if (!(await tneed(r, 8))) { return out; }
+        let status = bytes.read_byte(r.buf, r.pos + 1) & 255;
+        let hi = bytes.read_byte(r.buf, r.pos + 2) & 255;
+        let lo = bytes.read_byte(r.buf, r.pos + 3) & 255;
+        r.pos = r.pos + 8;                // consume the header
+        let plen = hi * 256 + lo - 8;
+        if (plen < 0 || plen > 67108864) { return out; }
+        if (plen > 0) {
+            if (!(await tneed(r, plen))) { return out; }   // may compact -> resets r.pos
+            // read_string COPIES into a fresh owned Nova string (the concat drains it) — a raw
+            // `bytes.alloc(plen) as string` intermediate would leak its buffer.
+            out = out + bytes.read_string(r.buf + r.pos, plen);
+            r.pos = r.pos + plen;
+        }
+        if ((status & 1) == 1) { return out; }   // EOM
+    }
+    return out;
+}
+
+// Raw send over the base AsyncStream (PRELOGIN is always cleartext) — parks on the write.
+pub async fn sendRaw(io: aio.AsyncStream, frame: string): int {
+    return await io.sendStr(frame);
+}
+// Channel send: over the reader's transport (raw socket, or TLS once encryption is on) — parks.
+pub async fn chanSend(r: TdsReader, frame: string): int {
+    return await r.io.sendStr(frame);
+}
