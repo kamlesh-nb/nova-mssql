@@ -739,12 +739,17 @@ pub fn decodeTokens(stream: string): MsResult {
     let res = MsResult();
     let c = Cur(stream);
     let cols = List<ColType>();
+    // `cur` is the result set currently being filled. A batch / stored procedure can return SEVERAL
+    // result sets back-to-back (each introduced by its own COLMETADATA); the first is res.rs and the
+    // rest are appended to res.rs.more, instead of merging every SELECT's rows into one set.
+    let cur = res.rs;
     let n = stream.length;
     while (c.pos < n) {
         let tok = cu8(c);
         if (tok == 129) {                 // 0x81 COLMETADATA
+            if (cur.columns.size() > 0) { let ns = ResultSet(); res.rs.more.push(ns); cur = ns; }
             cols = List<ColType>();
-            res.rs.columns = List<Column>();
+            cur.columns = List<Column>();
             let count = cu16(c);
             if (count != 65535) {
                 let i = 0;
@@ -754,7 +759,7 @@ pub fn decodeTokens(stream: string): MsResult {
                     let ct = parseTypeInfo(c);
                     let name = bVarchar(c);
                     cols.push(ct);
-                    res.rs.columns.push(Column(name, typemap.mapDbType(ct.t)));
+                    cur.columns.push(Column(name, typemap.mapDbType(ct.t)));
                     i = i + 1;
                 }
             }
@@ -765,7 +770,7 @@ pub fn decodeTokens(stream: string): MsResult {
                 row.cells.push(readValue(c, cols.get(i) ?? ColType(0)));
                 i = i + 1;
             }
-            res.rs.rows.push(row);
+            cur.rows.push(row);
         } else if (tok == 210) {          // 0xD2 NBCROW (null-bitmap-compressed row)
             // Sent instead of ROW when the row has any NULLs: a null bitmap (1 bit per column,
             // LSB-first) then a value for each NON-null column only.
@@ -782,7 +787,7 @@ pub fn decodeTokens(stream: string): MsResult {
                 }
                 i = i + 1;
             }
-            res.rs.rows.push(row);
+            cur.rows.push(row);
         } else if (tok == 170 || tok == 171) {   // 0xAA ERROR / 0xAB INFO
             let len = cu16(c);
             let start = c.pos;
