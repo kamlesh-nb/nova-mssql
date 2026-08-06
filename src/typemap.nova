@@ -39,25 +39,47 @@ pub fn msValueText(v: DbValue): string {
 
 // --- DbValue -> inline SQL literal (client-side `?` substitution) -------------
 pub fn substituteParams(sql: string, params: List<DbValue>): string {
-    // Positional `?` -> literal (parity with the other drivers' naive substitution).
+    // Inline-substitute BOTH placeholder styles so the same handler SQL works across the seam:
+    //   `$N`  (1-based, Postgres/seam style) -> params[N-1]
+    //   `?`   (positional) -> the next unused param
+    // NOTE: `$N` MUST be handled -- T-SQL parses a bare `$1` as the MONEY literal 1.00, so an
+    // un-substituted `CategoryID = $1` silently "works" (money 1 == int 1) while `Name LIKE $2`
+    // silently matches nothing. Both styles are naive client-side substitution (no server bind).
     let out = "";
     let pi = 0;
     let i = 0;
     while (i < sql.length) {
-        if (sql[i] == 63 && pi < params.size()) {   // '?'
+        if (sql[i] == 36 && i + 1 < sql.length && sql[i + 1] >= 48 && sql[i + 1] <= 57) {   // `$` + digit
+            let j = i + 1;
+            let num = 0;
+            while (j < sql.length && sql[j] >= 48 && sql[j] <= 57) { num = num * 10 + (sql[j] - 48); j = j + 1; }
+            out = out + literalOf(params.get(num - 1) ?? db.dbNull());
+            i = j;
+        } else if (sql[i] == 63 && pi < params.size()) {   // '?'
             out = out + literalOf(params.get(pi) ?? db.dbNull());
             pi = pi + 1;
+            i = i + 1;
         } else {
             out = out + charAt(sql, i);
+            i = i + 1;
         }
-        i = i + 1;
     }
     return out;
 }
 fn charAt(s: string, i: int): string { return string.slice(s, i, i + 1); }
+// Escape a single-quoted T-SQL string literal by doubling embedded quotes.
+fn sqlQuote(s: string): string {
+    let out = "'";
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] == 39) { out = out + "''"; } else { out = out + charAt(s, i); }   // '
+        i = i + 1;
+    }
+    return out + "'";
+}
 fn literalOf(v: DbValue): string {
     if (v.kind == DbType.Null) { return "NULL"; }
-    if (v.kind == DbType.Text) { return "'" + v.asText() + "'"; }
+    if (v.kind == DbType.Text) { return sqlQuote(v.asText()); }
     if (v.kind == DbType.Bool) { return if (v.asBool()) "1" else "0"; }
     if (v.kind == DbType.Decimal) { return `${v.asDecimal()}`; }
     return `${v.asLong()}`;

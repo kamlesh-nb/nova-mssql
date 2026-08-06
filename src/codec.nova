@@ -230,6 +230,7 @@ pub fn buildSqlBatch(sql: string): string {
 // of PG's text-format Bind / MySQL's VAR_STRING binding.
 
 pub const PKT_RPC: int = 3;
+pub const SP_EXECUTESQL: int = 10;
 pub const SP_PREPARE: int = 11;
 pub const SP_EXECUTE: int = 12;
 const SP_UNPREPARE: int = 15;
@@ -336,6 +337,27 @@ fn cbytes(c: Cur, n: int): string {
 }
 fn cremaining(c: Cur): int { return c.s.length - c.pos; }
 
+// Read a PLP (Partially Length-Prefixed) value body used by the MAX var-length types
+// (NVARCHAR(MAX)/VARCHAR(MAX)/VARBINARY(MAX)): an 8-byte length header (0xFFFFFFFFFFFFFFFF == PLP_NULL,
+// 0xFFFFFFFFFFFFFFFE == unknown length), then [u32 chunk-len][chunk bytes] repeated, ended by a u32 0
+// terminator. Returns the concatenated raw bytes ("" for NULL). Both header sentinels read as chunks.
+fn readPlp(c: Cur): string {
+    let hdr = cu64(c);
+    if (hdr == (-1 as long)) { return ""; }         // PLP_NULL (0xFFFFFFFFFFFFFFFF)
+    // For BOTH known-length and UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE), the body is chunk-framed:
+    // [u32 chunk-len][chunk bytes] repeated, ALWAYS ended by a u32 0 PLP_TERMINATOR (verified against
+    // MS-TDS 2.2.5.2.3 and microsoft/go-mssqldb readPLPType). The 8-byte header is only a size hint —
+    // it does NOT replace the terminator. Stopping by byte count left the 4-byte terminator unconsumed,
+    // desyncing the token stream after the first MAX cell so only the first row decoded (the 1-row bug).
+    let acc = "";
+    while (true) {
+        let clen = cu32(c);
+        if (clen == 0) { break; }
+        acc = acc + cbytes(c, clen as int);
+    }
+    return acc;
+}
+
 fn s16(v: int): int { if (v >= 32768) { return v - 65536; } return v; }
 fn s32(v: long): long { if (v >= 2147483648) { return v - 4294967296; } return v; }
 fn s64(v: long): long { return v; }   // already carried in a 64-bit word
@@ -390,6 +412,14 @@ const T_NCHAR: int = 239;   // 0xEF
 const T_BIGVARBIN: int = 165;// 0xA5
 const T_BIGBINARY: int = 173;// 0xAD
 const T_GUID: int = 36;     // 0x24
+const T_DATETIM4: int = 58;      // 0x3A smalldatetime (fixed 4)
+const T_DATETIME: int = 61;      // 0x3D datetime (fixed 8)
+const T_DATETIMN: int = 111;     // 0x6F nullable datetime/smalldatetime (len 4 or 8)
+const T_DATE: int = 40;          // 0x28 date (len-prefixed, 3 bytes)
+const T_TIME: int = 41;          // 0x29 time(scale) (scale byte in type-info)
+const T_DATETIME2: int = 42;     // 0x2A datetime2(scale)
+const T_DATETIMEOFFSET: int = 43;// 0x2B datetimeoffset(scale)
+const T_XML: int = 241;          // 0xF1 xml (PLP, UTF-16LE)
 
 struct ColType {
     pub t: int,
@@ -414,8 +444,102 @@ fn parseTypeInfo(c: Cur): ColType {
         cskip(c, 5);            // collation
     } else if (t == T_BIGVARBIN || t == T_BIGBINARY) {
         ct.len = cu16(c);
+    } else if (t == T_TIME || t == T_DATETIME2 || t == T_DATETIMEOFFSET) {
+        ct.scale = cu8(c);      // fractional-seconds precision (0..7)
+    } else if (t == T_DATETIMN) {
+        ct.len = cu8(c);        // 4 = smalldatetime, 8 = datetime
+    } else if (t == T_XML) {
+        // XMLTYPE: 1-byte schema-present flag; if set, dbname (B_VARCHAR), owning schema
+        // (B_VARCHAR), schema collection (US_VARCHAR). Value itself is PLP UTF-16LE.
+        let schemaPresent = cu8(c);
+        if (schemaPresent == 1) { bVarchar(c); bVarchar(c); usVarchar(c); }
     }
+    // T_DATE (fixed type-info: none) and T_DATETIME / T_DATETIM4 (fixed length, no type-info bytes)
+    // carry no extra metadata bytes.
     return ct;
+}
+
+// --- date/time helpers (TDS temporal decode) ---
+fn pow10l(n: int): long { let v = 1 as long; let i = 0; while (i < n) { v = v * 10; i = i + 1; } return v; }
+fn cuLE(c: Cur, n: int): long {
+    let v = 0 as long; let mul = 1 as long; let i = 0;
+    while (i < n) { v = v + (cu8(c) as long) * mul; mul = mul * 256; i = i + 1; }
+    return v;
+}
+fn pad2(v: long): string { if (v < 10) { return "0" + `${v}`; } return `${v}`; }
+fn padN(v: long, n: int): string {
+    let s = `${v}`;
+    while (s.length < n) { s = "0" + s; }
+    return s;
+}
+// Gregorian calendar date from a day count relative to 1970-01-01 (Howard Hinnant's algorithm).
+fn ymdFrom1970(z0: long): string {
+    let z = z0 + 719468;
+    let era = (if (z >= 0) z else z - 146096) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if (mp < 10) mp + 3 else mp - 9;
+    let yy = y + (if (m <= 2) 1 else 0);
+    return padN(yy, 4) + "-" + pad2(m) + "-" + pad2(d);
+}
+// A time-of-day expressed in 10^-scale second units since midnight -> "HH:MM:SS[.fffffff]".
+fn fmtTimeUnits(units: long, scale: int): string {
+    let p = pow10l(scale);
+    let totalSec = units / p;
+    let frac = units - totalSec * p;
+    let h = totalSec / 3600;
+    let m = (totalSec - h * 3600) / 60;
+    let s = totalSec - h * 3600 - m * 60;
+    let out = pad2(h) + ":" + pad2(m) + ":" + pad2(s);
+    if (scale > 0) { out = out + "." + padN(frac, scale); }
+    return out;
+}
+fn timeByteLen(scale: int): int { if (scale <= 2) { return 3; } if (scale <= 4) { return 4; } return 5; }
+// TIME/DATETIME2/DATETIMEOFFSET share a body: [time units (timeByteLen)] then (for the datetime
+// forms) [3-byte date = days since 0001-01-01] then (for offset) [2-byte signed minutes].
+fn decodeTemporal(c: Cur, t: int, scale: int, n: int): DbValue {
+    if (t == T_TIME) {
+        return db.dbText(fmtTimeUnits(cuLE(c, n), scale));
+    }
+    let tl = timeByteLen(scale);
+    let timeUnits = cuLE(c, tl);
+    let days = cuLE(c, 3);                       // days since 0001-01-01 (0001-01-01 == 0)
+    if (t == T_DATETIME2) {
+        return db.dbText(ymdFrom1970(days - 719162 as long) + " " + fmtTimeUnits(timeUnits, scale));
+    }
+    // DATETIMEOFFSET: the wire carries the instant in UTC plus a signed-minutes offset. Render the LOCAL
+    // wall-clock time (UTC + offset) with the zone suffix, matching the inserted literal and ISO 8601.
+    let off = cuLE(c, 2);
+    if (off >= 32768) { off = off - 65536; }     // signed minutes
+    let p = pow10l(scale);
+    let dayUnits = 86400 as long * p;
+    let total = days * dayUnits + timeUnits + off * 60 as long * p;
+    let ld = total / dayUnits;
+    let lt = total - ld * dayUnits;
+    let sign = if (off < 0) "-" else "+";
+    let ao = if (off < 0) 0 - off else off;
+    return db.dbText(ymdFrom1970(ld - 719162 as long) + " " + fmtTimeUnits(lt, scale)
+        + sign + pad2(ao / 60) + ":" + pad2(ao - (ao / 60) * 60));
+}
+// Legacy DATETIME (8) / SMALLDATETIME (4), days relative to 1900-01-01.
+fn decodeLegacyDateTime(c: Cur, n: int): DbValue {
+    if (n == 4) {
+        let days = cuLE(c, 2);
+        let mins = cuLE(c, 2);
+        let date = ymdFrom1970(days - 25567 as long);
+        return db.dbText(date + " " + pad2(mins / 60) + ":" + pad2(mins - (mins / 60) * 60) + ":00");
+    }
+    let days = cuLE(c, 4);
+    let ticks = cuLE(c, 4);                       // 1/300 second since midnight
+    let date = ymdFrom1970(days - 25567 as long);
+    let totalSec = ticks / 300;
+    let ms = (ticks - totalSec * 300) * 1000 / 300;
+    let h = totalSec / 3600; let m = (totalSec - h * 3600) / 60; let s = totalSec - h * 3600 - m * 60;
+    return db.dbText(date + " " + pad2(h) + ":" + pad2(m) + ":" + pad2(s) + "." + padN(ms, 3));
 }
 
 // Insert a decimal point `scale` places from the right of an integer digit string,
@@ -496,19 +620,44 @@ fn readValue(c: Cur, ct: ColType): DbValue {
         return db.dbBool(cu8(c) != 0);
     }
     if (t == T_NVARCHAR || t == T_NCHAR) {
+        // NVARCHAR(MAX) is PLP-encoded (ct.len == 0xFFFF from the type info): an 8-byte length header
+        // (PLP_NULL = 0xFFFFFFFFFFFFFFFF), then [u32 chunk-len][chunk bytes] repeated, ended by a u32 0
+        // terminator. Reading it as a regular USHORT-prefixed value desynced the token stream after the
+        // first MAX cell, so only the first row decoded before the walk hit garbage and stopped.
+        if (ct.len == 65535) { return db.dbText(utf16leDecode(readPlp(c))); }
         let n = cu16(c);
         if (n == 65535) { return db.dbNull(); }
         return db.dbText(utf16leDecode(cbytes(c, n)));
     }
     if (t == T_BIGVARCHR || t == T_BIGCHAR) {
+        if (ct.len == 65535) { return db.dbText(readPlp(c)); }   // VARCHAR(MAX), same PLP framing
         let n = cu16(c);
         if (n == 65535) { return db.dbNull(); }
         return db.dbText(cbytes(c, n));   // single-byte codepage -> as-is
     }
     if (t == T_BIGVARBIN || t == T_BIGBINARY) {
+        if (ct.len == 65535) { return db.dbBlob(readPlp(c)); }   // VARBINARY(MAX), PLP framing
         let n = cu16(c);
         if (n == 65535) { return db.dbNull(); }
         return db.dbBlob(cbytes(c, n));
+    }
+    if (t == T_XML) { return db.dbText(utf16leDecode(readPlp(c))); }   // XML: PLP UTF-16LE
+    if (t == T_DATE) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        return db.dbText(ymdFrom1970(cuLE(c, 3) - 719162 as long));   // days since 0001-01-01
+    }
+    if (t == T_TIME || t == T_DATETIME2 || t == T_DATETIMEOFFSET) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        return decodeTemporal(c, t, ct.scale, n);
+    }
+    if (t == T_DATETIME) { return decodeLegacyDateTime(c, 8); }
+    if (t == T_DATETIM4) { return decodeLegacyDateTime(c, 4); }
+    if (t == T_DATETIMN) {
+        let n = cu8(c);
+        if (n == 0) { return db.dbNull(); }
+        return decodeLegacyDateTime(c, n);
     }
     if (t == T_DECIMAL || t == T_NUMERIC || t == T_DECIMALN || t == T_NUMERICN) {
         let n = cu8(c);
@@ -567,7 +716,19 @@ pub struct MsResult {
     pub rs: ResultSet,
     pub affected: long,
     pub retval: long,        // D6: an sp_prepare RETURNVALUE (the prepared-statement handle)
-    init() { self.ok = true; self.err = ""; self.rs = ResultSet(); self.affected = 0; self.retval = 0; }
+    pub errno: int,          // TDS error number from the ERROR token (0 if none)
+    init() { self.ok = true; self.err = ""; self.rs = ResultSet(); self.affected = 0; self.retval = 0; self.errno = 0; }
+}
+// Map a SQL Server error number onto the normalized db.DBERR_* taxonomy.
+pub fn classifyMssqlErr(n: int): int {
+    if (n == 2627 || n == 2601) { return db.DBERR_UNIQUE_VIOLATION; }  // PK/unique / unique index
+    if (n == 515) { return db.DBERR_NOT_NULL; }                       // cannot insert NULL
+    if (n == 547) { return db.DBERR_FOREIGN_KEY; }                    // constraint (FK/check)
+    if (n == 1205) { return db.DBERR_DEADLOCK; }                      // deadlock victim
+    if (n == 1222) { return db.DBERR_LOCK_TIMEOUT; }                  // lock request timeout
+    if (n == 102 || n == 207 || n == 208) { return db.DBERR_SYNTAX; } // syntax / invalid column / object
+    if (n == 18456) { return db.DBERR_AUTH; }                         // login failed
+    return db.DBERR_UNKNOWN;
 }
 
 // B_VARCHAR: len(1) chars, UTF-16LE. US_VARCHAR: len(2) chars, UTF-16LE.
@@ -628,7 +789,7 @@ pub fn decodeTokens(stream: string): MsResult {
             let number = cu32(c);
             cskip(c, 2);                  // state + class
             let msg = usVarchar(c);
-            if (tok == 170) { res.ok = false; res.err = msg; }
+            if (tok == 170) { res.ok = false; res.err = msg; res.errno = number as int; }
             c.pos = start + len;          // skip the rest (server/proc/line)
         } else if (tok == 173) {          // 0xAD LOGINACK
             let len = cu16(c);

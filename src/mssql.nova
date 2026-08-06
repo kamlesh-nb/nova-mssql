@@ -50,12 +50,19 @@ pub struct MssqlConnection impl Connection {
     pub stmts: List<MsStmt>,   // D6: server-side prepared-statement cache (sp_prepare handles)
     pub busy: bool,            // concurrency guard: one in-flight request per connection
     pub resetPending: bool,    // T14: a pool set this on reuse; next batch/RPC carries RESETCONNECTION
+    pub failed: bool,          // set when connect/login/TLS failed: the connection is dead
+    pub failErr: string,       // the failure reason surfaced to the first query/exec
     init(reader: TdsReader) {
         self.reader = reader;
         self.stmts = List<MsStmt>();
         self.busy = false;
         self.resetPending = false;
+        self.failed = false;
+        self.failErr = "";
     }
+    // Mark this connection dead (login/TLS failure at connect). The first query/exec returns the reason
+    // instead of pretending to be live, so a failed connect no longer looks successful to the caller.
+    pub fn markFailed(self, why: string): void { self.failed = true; self.failErr = why; }
 
     // T14: a connection pool calls this when handing a reused connection back out. The next SQLBatch/RPC
     // this connection sends will carry the RESETCONNECTION (0x08) status bit, telling the server to reset
@@ -70,22 +77,30 @@ pub struct MssqlConnection impl Connection {
         return r;
     }
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.failed) { return errorResult(DbError("", self.failErr)); }
         if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let sn = await proto.chanSend(self.reader, codec.tdsPacketReset(codec.PKT_SQLBATCH, codec.buildSqlBatch(typemap.substituteParams(sql, params)), self.takeReset()));
-        let msg = await proto.readMessage(self.reader);
-        let r = codec.decodeTokens(msg);
-        if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token on the result
+        // SECURITY: with params, bind them SERVER-SIDE via sp_executesql instead of interpolating into
+        // the SQL text -- injection is then structurally impossible. No-param SQL keeps the SQLBatch path.
+        let r = if (params.size() > 0) await self.runBound(sql, params)
+                else await self.runBatch(sql);
+        if (!r.ok) { r.rs.err = DbError("", r.err).with(r.errno, codec.classifyMssqlErr(r.errno)); }   // T1: surface the TDS ERROR token on the result
         self.busy = false;
         return r.rs;
     }
+    async fn runBatch(self, sql: string): MsResult {
+        let sn = await proto.chanSend(self.reader, codec.tdsPacketReset(codec.PKT_SQLBATCH, codec.buildSqlBatch(sql), self.takeReset()));
+        let msg = await proto.readMessage(self.reader);
+        return codec.decodeTokens(msg);
+    }
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.failed) { return errorExec(DbError("", self.failErr)); }
         if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let sn = await proto.chanSend(self.reader, codec.tdsPacketReset(codec.PKT_SQLBATCH, codec.buildSqlBatch(typemap.substituteParams(sql, params)), self.takeReset()));
-        let msg = await proto.readMessage(self.reader);
-        let r = codec.decodeTokens(msg);
-        if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err)); }
+        // Same server-bound-param path as query() (see the SECURITY note there).
+        let r = if (params.size() > 0) await self.runBound(sql, params)
+                else await self.runBatch(sql);
+        if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err).with(r.errno, codec.classifyMssqlErr(r.errno))); }
         self.busy = false;
         return ExecResult(r.affected, "");
     }
@@ -134,6 +149,28 @@ pub struct MssqlConnection impl Connection {
     }
 
     // sp_execute(@handle, @P1, @P2, ...): the handle INTN then each bound param as NVARCHAR.
+    // One-shot server-bound execution via sp_executesql(@stmt, @params, @P1..@Pn). The param VALUES
+    // ride in the RPC, never interpolated into the SQL text, so SQL injection is structurally
+    // impossible. (Params bind as NVARCHAR today and rely on SQL Server implicit conversion; typed
+    // binding is the Phase 2 follow-on. `$N`/`?` placeholders are rewritten to @PN by convertPlaceholders.)
+    fn buildExecuteSqlRpc(self, sql: string, params: List<DbValue>): string {
+        let conv = codec.convertPlaceholders(sql);
+        let ps = codec.rpcParamNVarchar(conv.sql)
+            + codec.rpcParamNVarchar(codec.paramDecl(conv.nparams));
+        let i = 0;
+        while (i < params.size()) {
+            let p = params.get(i) ?? db.dbNull();
+            if (p.isNull()) { ps = ps + codec.rpcParamNVarcharNull(); }
+            else { ps = ps + codec.rpcParamNVarchar(typemap.msValueText(p)); }
+            i = i + 1;
+        }
+        return codec.tdsPacketReset(codec.PKT_RPC, codec.buildRpc(codec.SP_EXECUTESQL, ps), self.takeReset());
+    }
+    async fn runBound(self, sql: string, params: List<DbValue>): MsResult {
+        let _cs = await proto.chanSend(self.reader, self.buildExecuteSqlRpc(sql, params));
+        let msg = await proto.readMessage(self.reader);
+        return codec.decodeTokens(msg);
+    }
     fn buildExecuteRpc(self, handle: long, params: List<DbValue>): string {
         let ps = codec.rpcParamIntN(false, handle);
         let i = 0;
@@ -154,7 +191,7 @@ pub struct MssqlConnection impl Connection {
         let _cs = await proto.chanSend(self.reader, self.buildExecuteRpc(s.handle, params));
         let msg = await proto.readMessage(self.reader);
         let r = codec.decodeTokens(msg);
-        if (!r.ok) { r.rs.err = DbError("", r.err); }   // T1: surface the TDS ERROR token
+        if (!r.ok) { r.rs.err = DbError("", r.err).with(r.errno, codec.classifyMssqlErr(r.errno)); }   // T1: surface the TDS ERROR token
         self.busy = false;
         return r.rs;
     }
@@ -167,7 +204,7 @@ pub struct MssqlConnection impl Connection {
         let _cs = await proto.chanSend(self.reader, self.buildExecuteRpc(s.handle, params));
         let msg = await proto.readMessage(self.reader);
         let r = codec.decodeTokens(msg);
-        if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err)); }
+        if (!r.ok) { self.busy = false; return errorExec(DbError("", r.err).with(r.errno, codec.classifyMssqlErr(r.errno))); }
         self.busy = false;
         return ExecResult(r.affected, "");
     }
@@ -245,9 +282,11 @@ async fn tdsTlsHandshake(base: aio.AsyncStream, host: string, verify: bool, caPe
     bytes.free(hbuf);
     let ts = asynctls.TlsStream(base, bio);
     // Report the REAL handshake outcome (was hardcoded true, so a failed tunneled handshake looked
-    // successful). The TLS 1.2 memory-BIO authenticates the peer key exchange but does NOT yet validate
-    // the server certificate against a CA (tls12bio has no verify path); chain verification is a
-    // TLS-1.2-chain-verify follow-on before mssql can be MITM-safe. Callers check ts.ok().
+    // successful). When `verify` is set (trustServerCertificate=false), the TLS 1.2 memory-BIO
+    // VALIDATES the server certificate chain against `caPem` for `host` (tls12bio.trusts12) and fails
+    // the handshake if it does not chain to a trusted root, so ts.ok() is false and msConnectAsync
+    // fails the connection closed. With trustServerCertificate=true (the default for SQL Server's
+    // self-signed cert) the chain is not checked. Callers MUST check ts.ok().
     ts.handshakeOk = ok;
     return ts;
 }
@@ -269,15 +308,24 @@ async fn msConnectAsync(connectionString: string): MssqlConnection {
         let verify = !d.trustCert;
         let caPem = if (verify && d.caFile != "") File.readText(d.caFile) else "";
         let ts = await tdsTlsHandshake(base, d.host, verify, caPem);
-        if (!ts.ok()) { console.err("mssql: TLS handshake failed (cert not trusted?)"); }
+        if (!ts.ok()) {
+            console.err("mssql: TLS handshake failed (cert not trusted?)");
+            let dead = MssqlConnection(reader);
+            dead.markFailed("mssql: TLS handshake failed (cert not trusted / not verifiable)");
+            return dead;
+        }
         reader.io = ts;
     }
     // LOGIN7 (obfuscated password; encrypted iff TLS is on)
     let ln = await proto.chanSend(reader, codec.tdsPacket(codec.PKT_LOGIN7, codec.buildLogin7(d.user, d.password, d.database)));
     let login = await proto.readMessage(reader);
     let lr = codec.decodeTokens(login);
-    if (!lr.ok) { console.err(`mssql login failed: ${lr.err}`); }
-    return MssqlConnection(reader);
+    let conn = MssqlConnection(reader);
+    if (!lr.ok) {
+        console.err(`mssql login failed: ${lr.err}`);
+        conn.markFailed(`mssql login failed: ${lr.err}`);
+    }
+    return conn;
 }
 
 pub struct MssqlDriver impl Driver {
