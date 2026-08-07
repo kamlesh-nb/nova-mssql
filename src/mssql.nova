@@ -403,7 +403,12 @@ async fn msConnectAsync(connectionString: string): MssqlConnection {
         // it (SQL Server's default self-signed cert). A verify failure fails the handshake (ts.ok()).
         let verify = !d.trustCert;
         let caPem = if (verify && d.caFile != "") File.readText(d.caFile) else "";
+        // Bound the TDS-tunnelled TLS handshake: set a per-recv deadline on the base stream so a server
+        // that accepts PRELOGIN then stalls the handshake cannot hang the connect. Cleared afterwards so
+        // normal query reads are unbounded.
+        let _tlsTo = base.setTimeout(connection.connectTimeoutMs(connectionString));
         let ts = await tdsTlsHandshake(base, d.host, verify, caPem);
+        let _tlsTo2 = base.setTimeout(0);
         if (!ts.ok()) {
             console.err("mssql: TLS handshake failed (cert not trusted?)");
             let dead = MssqlConnection(reader);
