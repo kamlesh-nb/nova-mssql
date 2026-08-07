@@ -385,7 +385,12 @@ async fn tdsTlsHandshake(base: aio.AsyncStream, host: string, verify: bool, caPe
 // Whole connect (PRELOGIN → optional tunneled TLS → LOGIN7) as ONE async fn, driven once.
 async fn msConnectAsync(connectionString: string): MssqlConnection {
     let d = connection.parse(connectionString);
-    let base = await aio.asyncConnect(d.host, d.port);
+    let base = await aio.asyncConnectDeadline(d.host, d.port, connection.connectTimeoutMs(connectionString));
+    if (!base.ok()) {
+        let dead = MssqlConnection(TdsReader(base));
+        dead.markFailed("mssql: connect timed out or refused: " + d.host + ":" + `${d.port}`);
+        return dead;
+    }
     // PRELOGIN (cleartext) — advertise ON when the connection string asks for encryption, else NOT_SUP.
     let sn = await proto.sendRaw(base, codec.tdsPacket(codec.PKT_PRELOGIN, codec.buildPrelogin(d.encrypt)));
     let reader = TdsReader(base);        // reads PRELOGIN over the raw stream
