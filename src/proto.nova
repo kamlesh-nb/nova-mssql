@@ -44,6 +44,36 @@ async fn tneed(r: TdsReader, k: int): bool {
     return true;
 }
 
+// One TDS packet: its payload (header stripped) + whether its status byte set EOM (last packet of the
+// message). `ok` is false on a broken/short connection. Used by the X4 streaming reader to consume the
+// token stream one packet at a time instead of reassembling the whole message.
+pub struct TdsPacket {
+    pub payload: string,
+    pub eom: bool,
+    pub ok: bool,
+    init() { self.payload = ""; self.eom = false; self.ok = false; }
+}
+
+// Read exactly ONE TDS packet (the streaming primitive; readMessage is this in a loop until EOM).
+pub async fn readPacket(r: TdsReader): TdsPacket {
+    let pk = TdsPacket();
+    if (!(await tneed(r, 8))) { return pk; }
+    let status = bytes.read_byte(r.buf, r.pos + 1) & 255;
+    let hi = bytes.read_byte(r.buf, r.pos + 2) & 255;
+    let lo = bytes.read_byte(r.buf, r.pos + 3) & 255;
+    r.pos = r.pos + 8;
+    let plen = hi * 256 + lo - 8;
+    if (plen < 0 || plen > 67108864) { return pk; }
+    if (plen > 0) {
+        if (!(await tneed(r, plen))) { return pk; }
+        pk.payload = bytes.read_string(r.buf + r.pos, plen);
+        r.pos = r.pos + plen;
+    }
+    pk.ok = true;
+    pk.eom = (status & 1) == 1;
+    return pk;
+}
+
 // Read one full TDS MESSAGE (reassemble packets until the EOM status bit).
 pub async fn readMessage(r: TdsReader): string {
     let out = "";

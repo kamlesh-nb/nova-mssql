@@ -220,6 +220,97 @@ pub struct MssqlConnection impl Connection {
         let _msg = await proto.readMessage(self.reader);
         self.busy = false;
     }
+
+    // --- X4: true streaming over the TDS token stream -------------------------
+    // Send the query, then read the response ONE PACKET AT A TIME and decode ROW tokens lazily (see
+    // MsRowSource) instead of reassembling the whole message. The server keeps pushing packets under TCP
+    // backpressure, so a large result never materializes in full. Iterate:
+    //   let cur = await conn.queryStream("SELECT ...", params, 500);
+    //   while (let row = await cur.next()) { ... }
+    //   let _ = await cur.close();
+    // batchSize <= 0 defaults to 100. The connection stays busy until the cursor is drained or closed.
+    pub async fn queryStream(self, sql: string, params: List<DbValue>, batchSize: int): Cursor {
+        if (self.failed) { return cursorOver(errorResult(DbError("", self.failErr))); }
+        if (self.busy) { return cursorOver(errorResult(DbError("", "connection busy: concurrent use"))); }
+        self.busy = true;
+        let bs = if (batchSize > 0) batchSize else 100;
+        let frame = if (params.size() > 0) self.buildExecuteSqlRpc(sql, params)
+                    else codec.tdsPacketReset(codec.PKT_SQLBATCH, codec.buildSqlBatch(sql), self.takeReset());
+        let _sn = await proto.chanSend(self.reader, frame);
+        let src: RowBatchSource = MsRowSource(self, bs);
+        return Cursor(src);
+    }
+}
+
+// A lazy row source over the TDS token stream. It keeps `pending` = the not-yet-decoded token bytes and,
+// per fetchBatch, decodes tokens (codec.decodeOneToken) until it has `batchSize` rows or hits DONE. A
+// token that runs past `pending` returns TE_SHORT, so it reads another TDS packet (proto.readPacket),
+// appends the payload, and retries -- the memory-bounded equivalent of readMessage. On DONE/ERROR it
+// drains the rest of the message (so sp_executesql's trailing RETURNSTATUS/DONEPROC do not desync the
+// connection) and frees it for reuse.
+pub struct MsRowSource impl RowBatchSource {
+    pub conn: MssqlConnection,
+    pub batchSize: int,
+    pub pending: string,      // unconsumed token-stream bytes
+    pub cols: List<codec.ColType>,
+    pub columns: List<Column>,
+    pub eom: bool,            // the last TDS packet read carried EOM
+    pub done: bool,
+    pub e: DbError,
+    init(conn: MssqlConnection, batchSize: int) {
+        self.conn = conn; self.batchSize = batchSize;
+        self.pending = ""; self.cols = List<codec.ColType>(); self.columns = List<Column>();
+        self.eom = false; self.done = false; self.e = noError();
+    }
+
+    // Read one more TDS packet into `pending`. Returns false if the stream ended (broken / EOM already).
+    async fn pull(self: MsRowSource): bool {
+        if (self.eom) { return false; }
+        let pk = await proto.readPacket(self.conn.reader);
+        if (!pk.ok) { self.eom = true; return false; }
+        self.pending = self.pending + pk.payload;
+        if (pk.eom) { self.eom = true; }
+        return true;
+    }
+
+    async fn fetchBatch(self: MsRowSource): List<Row> {
+        let rows = List<Row>();
+        while (!self.done && rows.size() < self.batchSize) {
+            let c = codec.newCur(self.pending);
+            let ev = codec.decodeOneToken(c, self.cols);
+            if (ev.kind == codec.TE_SHORT) {
+                if (!(await self.pull())) { await self.finish(); break; }   // no more bytes -> end
+            } else {
+                self.pending = string.slice(self.pending, codec.curPos(c), self.pending.length);
+                if (ev.kind == codec.TE_COL) { self.cols = ev.cols; self.columns = ev.columns; }
+                else if (ev.kind == codec.TE_ROW) { rows.push(ev.row); }
+                else if (ev.kind == codec.TE_ERR) { self.e = DbError("", ev.err).with(ev.errno, codec.classifyMssqlErr(ev.errno)); }
+                else if (ev.kind == codec.TE_DONE) { if (!ev.more) { await self.finish(); } }
+                else if (ev.kind == codec.TE_END) { await self.finish(); }
+                // TE_SKIP: keep going
+            }
+        }
+        return rows;
+    }
+
+    // Drain the rest of the message (discard) so the connection is left at a clean message boundary, then
+    // release it. Idempotent.
+    async fn finish(self: MsRowSource): void {
+        if (self.done) { return; }
+        while (!self.eom) { let _ = await self.pull(); }
+        self.done = true;
+        self.conn.busy = false;
+    }
+
+    fn columns(self: MsRowSource): List<Column> { return self.columns; }
+    fn err(self: MsRowSource): DbError { return self.e; }
+    async fn close(self: MsRowSource): void { if (!self.done) { await self.finish(); } }
+}
+
+/// Connect and return the CONCRETE MssqlConnection (so callers can reach queryStream). Driver.connect
+/// returns the Connection trait; this is the mssql analogue of mongodb.open.
+pub async fn open(connectionString: string): MssqlConnection {
+    return await msConnectAsync(connectionString);
 }
 
 // Copy `n` bytes of a raw buffer into a fresh Nova string.

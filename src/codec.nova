@@ -314,21 +314,33 @@ pub fn paramDecl(n: int): string {
 }
 
 // --- read cursor over a decoded token-stream buffer (all LITTLE-endian) ---
-struct Cur {
+// The primitives are SHORT-GUARDED: reading past the end sets `short` and returns 0/"" instead of
+// over-reading. On a complete buffer (the classic decodeTokens path) the guards never trip, so behaviour
+// is unchanged; the streaming path (X4) uses `short` to detect a token that spans a not-yet-read packet
+// and refills, then retries the token from the start.
+pub struct Cur {
     pub s: string,
     pub pos: int,
-    init(s: string) { self.s = s; self.pos = 0; }
+    pub short: bool,
+    init(s: string) { self.s = s; self.pos = 0; self.short = false; }
 }
-fn cu8(c: Cur): int { let b = c.s[c.pos] & 255; c.pos = c.pos + 1; return b; }
+fn cu8(c: Cur): int {
+    if (c.pos + 1 > c.s.length) { c.short = true; return 0; }
+    let b = c.s[c.pos] & 255; c.pos = c.pos + 1; return b;
+}
 fn cu16(c: Cur): int { let a = cu8(c); let b = cu8(c); return a + b * 256; }
 fn cu32(c: Cur): long {
     let a = cu8(c) as long; let b = cu8(c) as long; let cc = cu8(c) as long; let d = cu8(c) as long;
     return a + b * 256 + cc * 65536 + d * 16777216;
 }
 fn cu64(c: Cur): long { let lo = cu32(c); let hi = cu32(c); return lo + hi * 4294967296; }
-fn cskip(c: Cur, n: int): void { c.pos = c.pos + n; }
+fn cskip(c: Cur, n: int): void {
+    if (c.pos + n > c.s.length) { c.short = true; c.pos = c.s.length; return; }
+    c.pos = c.pos + n;
+}
 fn cbytes(c: Cur, n: int): string {
     if (n <= 0) { return ""; }
+    if (c.pos + n > c.s.length) { c.short = true; return ""; }
     let p = bytes.alloc(n);
     let i = 0;
     while (i < n) { bytes.write_byte(p, i, c.s[c.pos + i] & 255); i = i + 1; }
@@ -734,6 +746,116 @@ pub fn classifyMssqlErr(n: int): int {
 // B_VARCHAR: len(1) chars, UTF-16LE. US_VARCHAR: len(2) chars, UTF-16LE.
 fn bVarchar(c: Cur): string { let n = cu8(c); return utf16leDecode(cbytes(c, n * 2)); }
 fn usVarchar(c: Cur): string { let n = cu16(c); return utf16leDecode(cbytes(c, n * 2)); }
+
+// --- X4 streaming: a one-token-at-a-time stepper over a growable buffer ------------------------------
+pub const TE_SHORT: int = 0;   // token spans not-yet-read bytes; caller refills and retries
+pub const TE_COL: int = 1;     // COLMETADATA: ev.cols (for row decode) + ev.columns (result metadata)
+pub const TE_ROW: int = 2;     // a decoded row in ev.row
+pub const TE_DONE: int = 3;    // DONE token: ev.more = another result set follows; ev.affected
+pub const TE_ERR: int = 4;     // ERROR token: ev.err / ev.errno
+pub const TE_SKIP: int = 5;    // a token consumed but not surfaced (INFO/ENVCHANGE/ORDER/RETURN*)
+pub const TE_END: int = 6;     // unknown token, cannot resync -> stop
+
+pub struct TokEvent {
+    pub kind: int,
+    pub cols: List<ColType>,
+    pub columns: List<Column>,
+    pub row: Row,
+    pub err: string,
+    pub errno: int,
+    pub more: bool,
+    pub affected: long,
+    init() {
+        self.kind = 0; self.cols = List<ColType>(); self.columns = List<Column>(); self.row = Row();
+        self.err = ""; self.errno = 0; self.more = false; self.affected = 0;
+    }
+}
+
+pub fn newCur(s: string): Cur { return Cur(s); }
+pub fn curPos(c: Cur): int { return c.pos; }
+
+// Decode exactly ONE token from `c`, reusing the same value decoders as decodeTokens. If the token runs
+// past the buffered bytes, RESTORE c.pos and return TE_SHORT (the streaming source reads another packet,
+// appends it, and retries the token). `cols` is the COLMETADATA in effect for ROW/NBCROW value decode.
+pub fn decodeOneToken(c: Cur, cols: List<ColType>): TokEvent {
+    let ev = TokEvent();
+    let start = c.pos;
+    let tok = cu8(c);
+    if (c.short) { c.pos = start; return ev; }
+    if (tok == 129) {                             // 0x81 COLMETADATA
+        let nc = List<ColType>();
+        let ncol = List<Column>();
+        let count = cu16(c);
+        if (count != 65535) {
+            let i = 0;
+            while (i < count) {
+                cskip(c, 4); cskip(c, 2);
+                let ct = parseTypeInfo(c);
+                let name = bVarchar(c);
+                nc.push(ct); ncol.push(Column(name, typemap.mapDbType(ct.t)));
+                i = i + 1;
+            }
+        }
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_COL; ev.cols = nc; ev.columns = ncol; return ev;
+    }
+    if (tok == 209) {                             // 0xD1 ROW
+        let row = Row();
+        let i = 0;
+        while (i < cols.size()) { row.cells.push(readValue(c, cols.get(i) ?? ColType(0))); i = i + 1; }
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_ROW; ev.row = row; return ev;
+    }
+    if (tok == 210) {                             // 0xD2 NBCROW
+        let ncol = cols.size();
+        let bm = cbytes(c, (ncol + 7) / 8);
+        let row = Row();
+        let i = 0;
+        while (i < ncol) {
+            let nb = bytes.read_byte(bm, i / 8) & 255;
+            if ((nb / (1 << (i % 8))) % 2 == 1) { row.cells.push(db.dbNull()); }
+            else { row.cells.push(readValue(c, cols.get(i) ?? ColType(0))); }
+            i = i + 1;
+        }
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_ROW; ev.row = row; return ev;
+    }
+    if (tok == 170 || tok == 171) {               // 0xAA ERROR / 0xAB INFO
+        let len = cu16(c);
+        if (c.short) { c.pos = start; return ev; }
+        let s2 = c.pos;
+        if (s2 + len > c.s.length) { c.pos = start; return ev; }   // whole token not buffered yet
+        let number = cu32(c); cskip(c, 2); let msg = usVarchar(c);
+        c.pos = s2 + len;
+        if (tok == 170) { ev.kind = TE_ERR; ev.err = msg; ev.errno = number as int; return ev; }
+        ev.kind = TE_SKIP; return ev;
+    }
+    if (tok == 227 || tok == 169 || tok == 173) { // 0xE3 ENVCHANGE / 0xA9 ORDER / 0xAD LOGINACK
+        let len = cu16(c);
+        if (c.short) { c.pos = start; return ev; }
+        cskip(c, len);
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_SKIP; return ev;
+    }
+    if (tok == 121) {                             // 0x79 RETURNSTATUS
+        cskip(c, 4);
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_SKIP; return ev;
+    }
+    if (tok == 172) {                             // 0xAC RETURNVALUE
+        cskip(c, 2); bVarchar(c); cskip(c, 1); cskip(c, 4); cskip(c, 2);
+        let ct = parseTypeInfo(c);
+        let v = readValue(c, ct);
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_SKIP; return ev;
+    }
+    if (tok == 253 || tok == 254 || tok == 255) { // DONE / DONEPROC / DONEINPROC
+        let status = cu16(c); cskip(c, 2); let rc = cu64(c);
+        if (c.short) { c.pos = start; return ev; }
+        ev.kind = TE_DONE; ev.more = (status & 1) != 0; ev.affected = rc; return ev;
+    }
+    ev.kind = TE_END; return ev;                  // unknown token
+}
 
 pub fn decodeTokens(stream: string): MsResult {
     let res = MsResult();
