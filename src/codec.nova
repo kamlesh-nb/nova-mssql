@@ -399,6 +399,58 @@ fn utf16leDecode(raw: string): string {
     return r;
 }
 
+// Windows-1252 code point for a single byte. 0x00-0x7F is ASCII; 0xA0-0xFF equals the Latin-1 code
+// point; 0x80-0x9F is the CP1252 special block (euro, smart quotes, dashes, ...). The five undefined
+// slots (0x81/0x8D/0x8F/0x90/0x9D) pass through unchanged.
+fn cp1252CodePoint(b: int): int {
+    if (b < 128) { return b; }
+    if (b >= 160) { return b; }
+    if (b == 128) { return 8364; }  if (b == 130) { return 8218; }  if (b == 131) { return 402; }
+    if (b == 132) { return 8222; }  if (b == 133) { return 8230; }  if (b == 134) { return 8224; }
+    if (b == 135) { return 8225; }  if (b == 136) { return 710; }   if (b == 137) { return 8240; }
+    if (b == 138) { return 352; }   if (b == 139) { return 8249; }  if (b == 140) { return 338; }
+    if (b == 142) { return 381; }   if (b == 145) { return 8216; }  if (b == 146) { return 8217; }
+    if (b == 147) { return 8220; }  if (b == 148) { return 8221; }  if (b == 149) { return 8226; }
+    if (b == 150) { return 8211; }  if (b == 151) { return 8212; }  if (b == 152) { return 732; }
+    if (b == 153) { return 8482; }  if (b == 154) { return 353; }   if (b == 155) { return 8250; }
+    if (b == 156) { return 339; }   if (b == 158) { return 382; }   if (b == 159) { return 376; }
+    return b;
+}
+
+// Windows-1252 (the default SQL Server VARCHAR/CHAR codepage) -> UTF-8. VARCHAR/CHAR data used to be
+// returned as RAW single-byte bytes, which silently corrupts any non-ASCII character (an accented
+// letter, a smart quote, the euro sign). ASCII passes through untouched (fast path), so the common
+// case pays nothing. NVARCHAR (UTF-16) is decoded by utf16leDecode and is unaffected. Non-1252 legacy
+// codepages are best-effort (1252 is a superset of Latin-1), the same posture as before but no longer
+// mojibake for the default collation.
+fn cp1252ToUtf8(raw: string): string {
+    let n = raw.length;
+    let hi = false;
+    let s = 0;
+    while (s < n) { if ((raw[s] & 255) >= 128) { hi = true; s = n; } else { s = s + 1; } }
+    if (!hi) { return raw; }
+    let out = bytes.alloc(n * 3 + 1);
+    let oi = 0;
+    let i = 0;
+    while (i < n) {
+        let cp = cp1252CodePoint(raw[i] & 255);
+        if (cp < 128) {
+            bytes.write_byte(out, oi, cp); oi = oi + 1;
+        } else if (cp < 2048) {
+            bytes.write_byte(out, oi, 192 + (cp / 64)); oi = oi + 1;
+            bytes.write_byte(out, oi, 128 + (cp & 63)); oi = oi + 1;
+        } else {
+            bytes.write_byte(out, oi, 224 + (cp / 4096)); oi = oi + 1;
+            bytes.write_byte(out, oi, 128 + ((cp / 64) & 63)); oi = oi + 1;
+            bytes.write_byte(out, oi, 128 + (cp & 63)); oi = oi + 1;
+        }
+        i = i + 1;
+    }
+    let r = bytes.read_string(out, oi);
+    bytes.free(out);
+    return r;
+}
+
 // --- TDS type codes ---
 const T_INT1: int = 48;     // 0x30 tinyint
 const T_INT2: int = 52;     // 0x34 smallint
@@ -642,10 +694,10 @@ fn readValue(c: Cur, ct: ColType): DbValue {
         return db.dbText(utf16leDecode(cbytes(c, n)));
     }
     if (t == T_BIGVARCHR || t == T_BIGCHAR) {
-        if (ct.len == 65535) { return db.dbText(readPlp(c)); }   // VARCHAR(MAX), same PLP framing
+        if (ct.len == 65535) { return db.dbText(cp1252ToUtf8(readPlp(c))); } // VARCHAR(MAX), PLP framing
         let n = cu16(c);
         if (n == 65535) { return db.dbNull(); }
-        return db.dbText(cbytes(c, n));   // single-byte codepage -> as-is
+        return db.dbText(cp1252ToUtf8(cbytes(c, n)));   // single-byte codepage (CP1252) -> UTF-8
     }
     if (t == T_BIGVARBIN || t == T_BIGBINARY) {
         if (ct.len == 65535) { return db.dbBlob(readPlp(c)); }   // VARBINARY(MAX), PLP framing
@@ -939,10 +991,14 @@ pub fn decodeTokens(stream: string): MsResult {
             let v = readValue(c, ct);
             res.retval = v.asLong();
         } else if (tok == 253 || tok == 254 || tok == 255) {  // DONE / DONEPROC / DONEINPROC
-            cskip(c, 2);                  // status
+            let status = cu16(c);         // status bits
             cskip(c, 2);                  // curcmd
             let rc = cu64(c);             // rowcount (TDS 7.2+: 8 bytes)
-            res.affected = rc;
+            // The rowcount is meaningful only when DONE_COUNT (0x10) is set; otherwise `rc` is
+            // undefined. Across a multi-statement batch each statement emits its own DONE with a
+            // count, so SUM the valid ones rather than overwrite (the old code kept only the last, so
+            // a two-INSERT batch reported the second insert's count as the whole batch's total).
+            if ((status & 16) != 0) { res.affected = res.affected + rc; }
         } else {
             // Unknown token — cannot safely resync; stop.
             return res;
